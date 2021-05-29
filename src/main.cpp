@@ -38,13 +38,15 @@ int main(){
 
     cairo::TCPListenerConfiguration tcplistener_config{
         stream_config: tcpstream_configuration,
+        max_number_of_fds: 1024,
+        max_number_of_queued_conns: 1024,
     };
 
     auto executor = cairo::Executor(executor_config);
     auto listener = cairo::TCPListener(tcplistener_config);
 
     // https://www.informit.com/articles/article.aspx?p=2204014
-    if (std::signal(SIGINT, [](int signal) -> void {
+    if (std::signal(SIGINT, [](int) -> void {
         sig_flag = 1;
     }) == SIG_ERR) {
         std::cout << "Unable to register signal handler.\n";

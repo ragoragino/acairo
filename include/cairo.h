@@ -12,17 +12,22 @@ namespace cairo {
 
     class TCPStream {
         public:
-            TCPStream(const TCPStreamConfiguration& config) : m_config(config) {}
+            TCPStream(const TCPStreamConfiguration& config, int fd) 
+                : m_fd(fd)
+                , m_config(config) {}
 
             std::vector<char> read(size_t number_of_bytes);
 
             void write(std::vector<char>&& buffer);
         private:
+            const int m_fd;
             const TCPStreamConfiguration m_config;
     };
 
      struct TCPListenerConfiguration {
         TCPStreamConfiguration stream_config;
+        size_t max_number_of_fds;
+        int max_number_of_queued_conns;
     };
 
     class TCPListener {
@@ -36,6 +41,7 @@ namespace cairo {
             void shutdown(std::chrono::seconds timeout);
 
         private:
+            int m_listener_sockfd = 0;
             const TCPListenerConfiguration m_config;
     };
 

@@ -4,6 +4,7 @@ PROJECT(cairo)
 SET(CPP_STANDARD 20)
 
 SET(GCC_COVERAGE_COMPILE_FLAGS "-fcoroutines")
+set(CMAKE_CXX_FLAGS "-std=c++1z -Wall -Wextra -Werror")
 
 ADD_LIBRARY(cairo STATIC "src/cairo.cpp")
 
