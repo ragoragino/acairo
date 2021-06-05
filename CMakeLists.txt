@@ -1,12 +1,16 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
 PROJECT(cairo)
 
+FIND_PACKAGE(Threads REQUIRED)
+
 SET(CPP_STANDARD 20)
 
 SET(GCC_COVERAGE_COMPILE_FLAGS "-fcoroutines")
-set(CMAKE_CXX_FLAGS "-std=c++1z -Wall -Wextra -Werror")
+SET(CMAKE_CXX_FLAGS "-std=c++1z -Wall -Wextra -Werror")
 
 ADD_LIBRARY(cairo STATIC "src/cairo.cpp")
+
+TARGET_LINK_LIBRARIES(cairo PRIVATE Threads::Threads)
 
 TARGET_INCLUDE_DIRECTORIES(cairo 
     PUBLIC "include"

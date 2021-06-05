@@ -9,6 +9,11 @@
 #include <fcntl.h>
 
 #include <sstream>
+#include <iostream>
+#include <cassert>
+
+// Use (void) to silent unused warnings.
+#define assertm(exp, msg) assert(((void)msg, exp))
 
 #include "cairo.h"
 
@@ -28,7 +33,7 @@ namespace cairo {
         return { address, port };
     }
 
-    void set_non_blocking_on_socket(int fd) {
+    void make_socket_non_blocking(int fd) {
         int flags = fcntl(fd, F_GETFL, 0);
         if (flags == -1) {
             throw std::runtime_error("Unable to get fd's flags.\n");
@@ -113,8 +118,7 @@ namespace cairo {
 
         if (::bind(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
             std::stringstream ss{};
-            ss << "Unable to bind socket to the address " << address << 
-                ": " << strerror(errno) << ".\n";
+            ss << "Unable to bind socket to the address " << address << ": " << strerror(errno) << ".\n";
             throw std::runtime_error(ss.str());
         }
 
@@ -124,16 +128,15 @@ namespace cairo {
             throw std::runtime_error(ss.str());
         }
 
-        set_non_blocking_on_socket(sockfd);
+        make_socket_non_blocking(sockfd);
 
         m_listener_sockfd = sockfd;
     }
 
-    TCPStream TCPListener::accept() {
-        if (m_listener_sockfd <= 0) {
-            std::runtime_error("Listening socket was not initialized.");
-        }
+    void TCPListener::start_epoll_listener() {
+        using namespace std::chrono_literals;
 
+        // Setup epoll
         auto epoll_fd = epoll_create1(0);
         if (epoll_fd < 0) {
             std::stringstream ss{};
@@ -155,16 +158,35 @@ namespace cairo {
             throw std::runtime_error("Unable to allocate memory for epoll_events");
         }
 
-        while (true) {
-            int count_of_ready_fds = epoll_wait(epoll_fd, events, m_config.max_number_of_fds, 100);
+        std::unique_lock<std::mutex> events_lock(m_events_mutex, std::defer_lock);
+        while (!m_stopped) {
+            // Check how many events can be accepted. If no events, 
+            // then wait for the consumers to accept some of the waiting connections.
+            int events_buffer_size;
+            while (true) {
+                events_lock.lock();
+                events_buffer_size = m_config.max_number_of_fds - m_events_count;
+                events_lock.unlock();
+
+                assertm(events_buffer_size >= 0, "Space available for events is negative.");
+
+                if (events_buffer_size != 0) {
+                    break;
+                }
+                
+                std::this_thread::sleep_for(100ms);
+            }   
+
+            // Get new events from epoll
+            int count_of_ready_fds = epoll_wait(epoll_fd, events, events_buffer_size, 100);
             if (count_of_ready_fds < 0) {
                 std::stringstream ss{};
                 ss << "Waititing for epoll_events failed: " << strerror(errno) << ".\n";
                 throw std::runtime_error(ss.str());
-            } else if (count_of_ready_fds == 0) {
-                continue;
             }
-            
+
+            // Check how many new connections are waiting to be accepted
+            int count_of_valid_fs = 0;
             for (int i = 0; i < count_of_ready_fds; i++) {
                 if (events[i].events & EPOLLERR) {
                     // TODO
@@ -173,47 +195,100 @@ namespace cairo {
                     throw std::runtime_error(ss.str());
                 }
 
-                struct sockaddr_in peer_addr;
-                socklen_t peer_addr_len = sizeof(peer_addr);
-                int newsockfd = ::accept(m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
-                if (newsockfd < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // This can happen due to the nonblocking socket mode; in this
-                        // case don't do anything, but print a notice (since these events
-                        // are extremely rare and interesting to observe...)
-                        printf("accept returned EAGAIN or EWOULDBLOCK\n");
-                    } else {
-                        std::stringstream ss{};
-                        ss << "Accepting new connedction failed: " << strerror(errno) << ".\n";
-                        throw std::runtime_error(ss.str());
-                    }
-                } else {
-                    // TODO: Add later
-                    // set_non_blocking_on_socket(newsockfd);
-
-                    if (newsockfd >= m_config.max_number_of_queued_conns) {
-                        // TODO: Continue on while
-                        // Might it block?
-                        close(newsockfd);
-                        continue;
-                    }
-
-                    // TODO: Return some generator
-                    return TCPStream(m_config.stream_config, newsockfd);   
-                }
+                count_of_valid_fs++;
             }
+
+            // Notify waiting threads
+            events_lock.lock();
+            m_events_count += count_of_valid_fs;
+            events_lock.unlock();
+
+            m_events_cv.notify_all();
         }
     }
 
-    void TCPListener::shutdown(std::chrono::seconds) {
-        // TODO
+    TCPStream TCPListener::accept(std::chrono::seconds timeout) {
+        if (m_listener_sockfd <= 0) {
+            std::runtime_error("Listening socket was not initialized.");
+        }
+
+        // Lazily initialize thread waiting for epoll events
+        if (auto lock = std::unique_lock<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
+            this->start_epoll_listener();
+        }
+
+        // Wait for a new event, if there is no available
+        if(auto lock = std::unique_lock<std::mutex>(m_events_mutex); m_events_count <= 0 ){
+            assertm(m_events_count == 0, "Count of events is negative");
+
+            if (!m_events_cv.wait_for(lock, timeout, [this]{ return m_events_count > 0; })) {
+                throw DeadlineExceededError();
+            }
+
+            m_events_count--;
+        }
+        
+        // Accept new connection
+        struct sockaddr_in peer_addr;
+        socklen_t peer_addr_len = sizeof(peer_addr);
+        int newsockfd = ::accept(m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
+        if (newsockfd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // This can happen due to the nonblocking socket mode; in this
+                // case don't do anything, but print a notice (since these events
+                // are extremely rare and interesting to observe...)                       
+                std::cout << "Accepting new connection failed due to EAGAIN or EWOULDBLOCK.\n";
+            } else {
+                std::stringstream ss{};
+                ss << "Accepting new connection failed: " << strerror(errno) << ".\n";
+                throw std::runtime_error(ss.str());
+            }
+
+            // TODO: What to return here? Probably loop over.
+        }
+
+        // TODO: Add later
+        // set_non_blocking_on_socket(newsockfd);
+        return TCPStream(m_config.stream_config, newsockfd);   
     }
 
-    void Executor::spawn(Awaitable&&) {
-        // TODO
+    void TCPListener::shutdown(std::chrono::seconds) {
+        // TODO: Honor timeout if possible
+        if (auto lock = std::unique_lock<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
+            m_stopped = true;
+            m_epoll_thread.join();
+        }
+    }
+
+   
+    void Executor::spawn(Task&&) {
+       // TODO     
     }
 
     void Executor::stop() {
         // TODO
+    }
+
+    void Executor::start_thread() {
+        std::unique_lock<std::mutex> lock(m_work_queue_mutex, std::defer_lock);
+        while (!m_stopped) {
+            lock.lock();
+            if (m_work_queue.size() == 0) {
+                bool timed_out = m_work_queue_cv.wait_for(lock, m_work_waiting_timeout, [this]{ return m_work_queue.size() > 0; });
+                if (timed_out) {
+                    continue;
+                }
+            }
+
+            auto work_unit = m_work_queue.back();
+            m_work_queue.pop();
+            lock.unlock();
+
+            try {
+                work_unit();
+            } catch(std::exception) {
+                work_unit.set_exception(std::current_exception());
+            }
+        }
     }
 }

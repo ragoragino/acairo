@@ -42,8 +42,8 @@ int main(){
         max_number_of_queued_conns: 1024,
     };
 
-    auto executor = cairo::Executor(executor_config);
-    auto listener = cairo::TCPListener(tcplistener_config);
+    cairo::Executor executor(executor_config);
+    cairo::TCPListener listener(tcplistener_config);
 
     // https://www.informit.com/articles/article.aspx?p=2204014
     if (std::signal(SIGINT, [](int) -> void {
@@ -54,13 +54,17 @@ int main(){
     }
 
     while(sig_flag == 0) {
-        cairo::TCPStream stream = listener.accept();
+        try { 
+            cairo::TCPStream stream = listener.accept(1s);
 
-        auto handler = [&stream](){ 
-            handle_socket(std::move(stream));
-        };
+            auto handler = [&stream](){ 
+                handle_socket(std::move(stream));
+            };
 
-        executor.spawn(cairo::Awaitable(handler));
+            executor.spawn(cairo::Task(handler));
+        } catch(cairo::DeadlineExceededError) {
+            continue;
+        }
     }
 
     std::cout << "Shutting down cairo.\n";
