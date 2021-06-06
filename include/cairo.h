@@ -8,12 +8,16 @@
 #include <queue>
 #include <atomic>
 #include <condition_variable>
+#include <optional>
+#include <random>
+#include <limits>
+#include <memory>
 
 namespace cairo {
 
-    struct DeadlineExceededError : public std::exception {
+    struct TCPListenerStoppedError : public std::exception {
         const char * what () const noexcept {
-            return "Deadline exceeded.";
+            return "TCPListener was stopped.";
         }
     };
 
@@ -31,6 +35,9 @@ namespace cairo {
             std::vector<char> read(size_t number_of_bytes);
 
             void write(std::vector<char>&& buffer);
+
+            ~TCPStream();
+
         private:
             const int m_fd;
             const TCPStreamConfiguration m_config;
@@ -44,16 +51,20 @@ namespace cairo {
 
     class TCPListener {
         public:
-            TCPListener(const TCPListenerConfiguration& config) : m_config(config) {}
+            TCPListener(const TCPListenerConfiguration& config) 
+                : m_stopped(false)
+                , m_config(config) {}
 
             void bind(const std::string& address);
 
-            TCPStream accept(std::chrono::seconds timeout);
+            std::shared_ptr<TCPStream> accept();
 
-            void shutdown(std::chrono::seconds timeout);
+            void shutdown();
 
         private:
             void start_epoll_listener();
+
+            void wait_for_new_connection();
 
             int m_events_count;
             std::mutex m_events_mutex;
@@ -82,8 +93,11 @@ namespace cairo {
 
      class Task {
         public:
+            using id_type = unsigned long long;
+
             Task(std::function<void()>&& f) 
-                : m_f(f) {}
+                : m_id(generate_id())
+                , m_f(f) {}
 
             void operator()(){
                 m_f();
@@ -93,7 +107,20 @@ namespace cairo {
                 m_exception = e;
             }
 
+            id_type get_id() const {
+                return m_id;
+            }
+
         private:
+            id_type generate_id() {
+                static std::random_device rd;
+                static std::mt19937 gen(rd());
+                static std::uniform_int_distribution<id_type> dis(std::numeric_limits<id_type>::min(), 
+                    std::numeric_limits<id_type>::max());
+                return dis(gen);
+            }
+
+            id_type m_id;
             std::exception_ptr m_exception;
             std::function<void()> m_f;
     };
@@ -102,9 +129,10 @@ namespace cairo {
         public:
             Executor(const ExecutorConfiguration& config) 
                 : m_threadPool(config.number_of_worker_threads)
+                , m_stopped(false)
                 , m_config(config) {
                     for(std::uint8_t i = 0; i != m_config.number_of_worker_threads; i++) {
-                        m_threadPool[i] = std::thread(&Executor::start_thread, this);
+                        m_threadPool[i] = std::thread(&Executor::start_worker, this);
                     }
             }
 
@@ -113,7 +141,9 @@ namespace cairo {
             void stop();
 
         private:
-            void start_thread();
+            void start_worker();
+
+            std::optional<Task> get_new_work_unit();
             
             std::vector<std::thread> m_threadPool;
 

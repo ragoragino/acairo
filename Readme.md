@@ -1,4 +1,6 @@
-# Start working on executor
+# Handle thread exceptions
+# Proper logging library
+# Fix handling of epoll_wait
 
 
 1. Compiler creates promise object on the stack of the coroutine

@@ -8,17 +8,17 @@
 
 volatile sig_atomic_t sig_flag = 0;
 
-void handle_socket(cairo::TCPStream&& stream) {
+void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
     try {
         const std::string send_message = "Is there anybody out there?";
         std::vector<char> vector_message(send_message.begin(), send_message.end());
-        stream.write(std::move(vector_message));
+        stream->write(std::move(vector_message));
 
         std::cout << "Writing to socket was successful." << "\n"; 
 
-        std::vector<char> received_message = stream.read(4);
+        // std::vector<char> received_message = stream.read(4);
 
-        std::cout << "Reading from socket was succesful." << "\n"; 
+        // std::cout << "Reading from socket was succesful." << "\n"; 
     } catch (std::exception& e){
         std::cout << "handle_socket failed: " << e.what() << "\n"; 
     }
@@ -53,25 +53,37 @@ int main(){
         exit(1);
     }
 
-    while(sig_flag == 0) {
+    auto shutdownHandler = std::thread([&](){
+        while (sig_flag == 0) {
+            std::this_thread::sleep_for(500ms);
+        }
+
+        std::cout << "Shutting down cairo.\n";
+
+        listener.shutdown();
+
+        executor.stop();
+    });
+
+    listener.bind("127.0.0.1:8080");
+
+    while(true) {
         try { 
-            cairo::TCPStream stream = listener.accept(1s);
+            auto stream = listener.accept();
 
-            auto handler = [&stream](){ 
-                handle_socket(std::move(stream));
-            };
+            executor.spawn(cairo::Task([stream](){ 
+                handle_socket(stream);
+            }));
+        } catch(cairo::TCPListenerStoppedError) {
+            if (sig_flag == 1) {
+                break;
+            }
 
-            executor.spawn(cairo::Task(handler));
-        } catch(cairo::DeadlineExceededError) {
-            continue;
+            throw;
         }
     }
 
-    std::cout << "Shutting down cairo.\n";
-
-    listener.shutdown(5s);
-
-    executor.stop();
+    shutdownHandler.join();
 
     return 0;
 }
