@@ -64,11 +64,11 @@ namespace cairo {
         private:
             void start_epoll_listener();
 
-            void wait_for_new_connection();
+            int process_waiting_connections(struct epoll_event* events, int waiting_conns_count);
 
-            int m_events_count;
-            std::mutex m_events_mutex;
-            std::condition_variable m_events_cv;
+            std::queue<int> m_accepted_conns;
+            std::mutex m_accepted_conns_mutex;
+            std::condition_variable m_accepted_conns_cv;
 
             std::thread m_epoll_thread;
             std::mutex m_epoll_thread_mutex;

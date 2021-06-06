@@ -188,58 +188,71 @@ namespace cairo {
             throw std::runtime_error("Unable to allocate memory for epoll_events");
         }
 
-        std::unique_lock<std::mutex> events_lock(m_events_mutex, std::defer_lock);
-        while (!m_stopped) {          
-            // Check how many events can be accepted. If no events, 
-            // then wait for the consumers to accept some of the waiting connections.
-            int events_buffer_size;
-            while (true) {
-                events_lock.lock();
-                events_buffer_size = m_config.max_number_of_fds - m_events_count;
-                events_lock.unlock();
+        while (!m_stopped) {    
+            // Wait for the consumer to process at least some of the accepted connections
+            bool consumer_throttled = false;
+            {
+                std::lock_guard<std::mutex> lock(m_accepted_conns_mutex); 
+                assertm(m_config.max_number_of_fds >= m_accepted_conns.size(), "Limit of accepted connections was exceeded.");
+                consumer_throttled = m_config.max_number_of_fds == m_accepted_conns.size();
+            }
+            
+            if (consumer_throttled) {
+                std::this_thread::sleep_for(100ms); 
+            }
 
-                assertm(events_buffer_size >= 0, "Space available for events is negative.");
-
-                if (events_buffer_size != 0) {
-                    break;
-                }
-                
-                std::this_thread::sleep_for(100ms);
-            }   
-
-            // Get new events from epoll
-            int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, events_buffer_size, 100);
+            int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, m_config.max_number_of_fds, 100);
             if (count_of_ready_fds < 0) {
                 std::stringstream ss{};
                 ss << "Waititing for epoll_events failed: " << strerror(errno) << ".\n";
                 throw std::runtime_error(ss.str());
             }
 
-            // Check how many new connections are waiting to be accepted
-            int count_of_valid_fs = 0;
-            for (int i = 0; i < count_of_ready_fds; i++) {
-                if (events[i].events & EPOLLERR) {
-                    // TODO: Check properly this event
-                    std::stringstream ss{};
-                    ss << "epoll_wait returned EPOLLERR: " << strerror(errno) << ".\n";
-                    throw std::runtime_error(ss.str());
-                }
-
-                count_of_valid_fs++;
-            }
-
-            if (count_of_valid_fs == 0) {
+            int processed_conns_count = process_waiting_connections(events, count_of_ready_fds);
+            if (processed_conns_count == 0) {
                 continue;
             }
 
-            // Notify waiting threads
-            events_lock.lock();
-            m_events_count += count_of_valid_fs;
-            std::cout << "Number of new connections to accept: " << m_events_count << "\n";
-            events_lock.unlock();
+            std::cout << "Number of accepted connections pushed to the buffer: " << processed_conns_count << "\n";
 
-            m_events_cv.notify_all();
+            m_accepted_conns_cv.notify_all();
         }
+    }
+
+    int TCPListener::process_waiting_connections(struct epoll_event* events, int waiting_conns_count) {
+        std::lock_guard<std::mutex> lock(m_accepted_conns_mutex);
+
+        size_t original_conns_count = m_accepted_conns.size();
+
+        for (int i = 0; i < waiting_conns_count; i++) {
+            if (events[i].events & EPOLLERR) {
+                // TODO: Check properly this event
+                std::stringstream ss{};
+                ss << "epoll_wait returned EPOLLERR: " << strerror(errno) << ".\n";
+                throw std::runtime_error(ss.str());
+            }
+
+            if (m_accepted_conns.size() == m_config.max_number_of_fds) {
+                return m_accepted_conns.size() - original_conns_count;
+            }
+            
+            struct sockaddr_in peer_addr;
+            socklen_t peer_addr_len = sizeof(peer_addr);
+            int newsockfd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
+            if (newsockfd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    std::cout << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.\n";
+                } else {
+                    std::stringstream ss{};
+                    ss << "Accepting new connection failed: " << strerror(errno) << ".\n";
+                    throw std::runtime_error(ss.str());
+                }
+            }
+
+            m_accepted_conns.push(newsockfd);
+        }
+
+        return m_accepted_conns.size() - original_conns_count;
     }
 
     // TODO: Remove timeout
@@ -249,51 +262,30 @@ namespace cairo {
         }
 
         // Lazily initialize thread waiting for epoll events
-        if (auto lock = std::unique_lock<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
+        if (auto lock = std::lock_guard<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
             m_epoll_thread = std::thread(&TCPListener::start_epoll_listener, this);
         }
         
-        // Accept new connection
-        int newsockfd = -1;
-        while (newsockfd < 0) {
-            struct sockaddr_in peer_addr;
-            socklen_t peer_addr_len = sizeof(peer_addr);
-
-            newsockfd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
-            if (newsockfd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // std::cout << "EAGAIN or EWOULDBLOCK. Going to wait for new connection.\n";
-                    wait_for_new_connection();
-                } else {
-                    std::stringstream ss{};
-                    ss << "Accepting new connection failed: " << strerror(errno) << ".\n";
-                    throw std::runtime_error(ss.str());
-                }
-            }
-        }
-
-        // TODO: Add later
-        // set_non_blocking_on_socket(newsockfd);
-        return std::make_shared<TCPStream>(m_config.stream_config, newsockfd);   
-    }
-
-    void TCPListener::wait_for_new_connection(){
-        std::unique_lock<std::mutex> lock(m_events_mutex);
-        if (m_events_count <= 0) {
-            assertm(m_events_count == 0, "Count of events is negative");
-
-            m_events_cv.wait(lock, [this]{ return m_events_count > 0 || m_stopped; });
+        // Take new connection from the queue of accepted connections
+        std::unique_lock<std::mutex> lock(m_accepted_conns_mutex);
+        if (m_accepted_conns.size() == 0) {
+            m_accepted_conns_cv.wait(lock, [this]{ return m_accepted_conns.size() > 0 || m_stopped; });
             if (m_stopped) {
                 throw TCPListenerStoppedError();
             }
         }
 
-        m_events_count--;
+        int accepted_conn_fd = m_accepted_conns.back();
+        m_accepted_conns.pop();
+        
+        // TODO: Add later
+        // set_non_blocking_on_socket(newsockfd);
+        return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd);   
     }
 
     void TCPListener::shutdown() {
         m_stopped = true;
-        m_events_cv.notify_all();
+        m_accepted_conns_cv.notify_all();
 
         std::lock_guard<std::mutex> lock(m_epoll_thread_mutex); 
         if (m_epoll_thread.joinable()) {

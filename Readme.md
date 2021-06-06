@@ -1,7 +1,5 @@
-# Handle thread exceptions
-# Proper logging library
-# Fix handling of epoll_wait
-
+#### Handle thread exceptions
+#### Proper logging library
 
 1. Compiler creates promise object on the stack of the coroutine
 2. promise.get_return_object() returns the resumable objects (return object of the coroutine)
