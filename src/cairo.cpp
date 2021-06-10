@@ -19,6 +19,14 @@
 #include "cairo.h"
 
 namespace cairo {
+    // Create an error message containing stringified errno
+    std::string error_with_errno(const std::string& message){
+        std::stringstream ss{};
+        ss << message << ": " << strerror(errno) << ".\n";
+        return ss.str();
+    }
+
+    // Retry syscalls on EINTR
     template<typename F, typename... Args>
     int retry_sys_call(F&& f, Args&&... args) {
         while (true) {
@@ -32,29 +40,38 @@ namespace cairo {
         }
     }
 
+    // Split listening address to an IP address and port 
+    // (default port being 80 and address 127.0.0.1)
     std::pair<std::string, int> split_address(const std::string& full_address) {
-        std::string portStr = "80";
+        int defaulPort = 80;
+
+        if (full_address.empty()) {
+            return { "127.0.0.1", defaulPort };
+        }
+
+        int port = defaulPort;
         std::string address = full_address;
         
         auto const pos = full_address.find_last_of(':');
         if (pos != std::string::npos) {
-            portStr = full_address.substr(pos+1);
+            std::string portStr = full_address.substr(pos+1);
+            port = std::atoi(portStr.c_str());
+
             address = full_address.substr(0, pos);
         }
-
-        int port = std::atoi(portStr.c_str());
         
         return { address, port };
     }
 
+    // Set nonblocking flag on the socket 
     void make_socket_non_blocking(int fd) {
-        int flags = fcntl(fd, F_GETFL, 0);
+        int flags = retry_sys_call(fcntl, fd, F_GETFL, 0);
         if (flags == -1) {
-            throw std::runtime_error("Unable to get fd's flags.\n");
+            throw std::runtime_error(error_with_errno("Unable to get fd's flags"));
         }
 
-        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            throw std::runtime_error("Unable to set O_NONBLOCK on the socket.\n");
+        if (retry_sys_call(fcntl, fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            throw std::runtime_error(error_with_errno("Unable to set O_NONBLOCK on the socket."));
         }
     }
 
@@ -75,9 +92,7 @@ namespace cairo {
                     continue;
                 }
 
-                std::stringstream ss{};
-                ss << "Unable to read from the socket: " << strerror(errno) << ".\n";
-                throw std::runtime_error(ss.str());
+                throw std::runtime_error(error_with_errno("Unable to read from the socket"));
             }
 
             remaining_buffer_size -= number_of_bytes_written;
@@ -102,9 +117,7 @@ namespace cairo {
                     continue;
                 }
 
-                std::stringstream ss{};
-                ss << "Unable to write to the socket: " << strerror(errno) << ".\n";
-                throw std::runtime_error(ss.str());
+                throw std::runtime_error(error_with_errno("Unable to write to the socket"));
             }
 
             remaining_buffer_size -= number_of_bytes_written;
@@ -115,8 +128,8 @@ namespace cairo {
     }
 
     TCPStream::~TCPStream(){
-        // TODO: Can this block?
-        int result = ::close(m_fd);
+        // Close shouldn't block on non-blocking sockets
+        int result = retry_sys_call(::close, m_fd);
         if (result < 0) {
             std::cout << "Unable to close file descriptor: " << strerror(errno) << ".\n";
         }
@@ -127,17 +140,13 @@ namespace cairo {
 
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd < 0) {
-            std::stringstream ss{};
-            ss << "Unable to add create socket: " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to add create socket"));
         }
 
         // Avoid spurious EADDRINUSE (previous instance of this server might have died)
         int opt = 1;
         if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            std::stringstream ss{};
-            ss << "Unable to set EADDRINUSE on a socket: " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to set EADDRINUSE on a socket"));
         }
 
         struct sockaddr_in serv_addr;
@@ -147,15 +156,11 @@ namespace cairo {
         serv_addr.sin_port = htons(port);
 
         if (::bind(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-            std::stringstream ss{};
-            ss << "Unable to bind socket to the address " << address << ": " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to bind socket to the address"));
         }
 
         if (listen(sockfd, m_config.max_number_of_queued_conns) < 0) {
-            std::stringstream ss{};
-            ss << "Unable to mark the socket as a listening socket: " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to mark the socket as a listening socket"));
         }
 
         make_socket_non_blocking(sockfd);
@@ -163,23 +168,18 @@ namespace cairo {
         m_listener_sockfd = sockfd;
     }
 
-    void TCPListener::start_epoll_listener() {
+    void TCPListener::run_epoll_listener() {
         using namespace std::chrono_literals;
 
-        // Setup epoll
         auto epoll_fd = epoll_create1(0);
         if (epoll_fd < 0) {
-            std::stringstream ss{};
-            ss << "Unable to create a fd with epoll: " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
         }
 
         struct epoll_event accept_event;
         accept_event.events = EPOLLIN;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, m_listener_sockfd, &accept_event) < 0) {
-            std::stringstream ss{};
-            ss << "Unable to add listener socket to the epoll interest list: " << strerror(errno) << ".\n";
-            throw std::runtime_error(ss.str());
+            throw std::runtime_error(error_with_errno("Unable to add listener socket to the epoll interest list"));
         }
 
         struct epoll_event* events = (struct epoll_event*)calloc(m_config.max_number_of_fds, 
@@ -189,23 +189,24 @@ namespace cairo {
         }
 
         while (!m_stopped) {    
-            // Wait for the consumer to process at least some of the accepted connections
-            bool consumer_throttled = false;
+            // In case consumer threads arer slow, wait for them until they
+            // process at least some of the accepted connections
+            bool consumers_throttled = false;
             {
                 std::lock_guard<std::mutex> lock(m_accepted_conns_mutex); 
                 assertm(m_config.max_number_of_fds >= m_accepted_conns.size(), "Limit of accepted connections was exceeded.");
-                consumer_throttled = m_config.max_number_of_fds == m_accepted_conns.size();
+                consumers_throttled = m_config.max_number_of_fds == m_accepted_conns.size();
             }
             
-            if (consumer_throttled) {
+            if (consumers_throttled) {
+                // TODO: Make this configurable
                 std::this_thread::sleep_for(100ms); 
+                continue;
             }
 
             int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, m_config.max_number_of_fds, 100);
             if (count_of_ready_fds < 0) {
-                std::stringstream ss{};
-                ss << "Waititing for epoll_events failed: " << strerror(errno) << ".\n";
-                throw std::runtime_error(ss.str());
+                throw std::runtime_error("Waititing for epoll_events failed");
             }
 
             int processed_conns_count = process_waiting_connections(events, count_of_ready_fds);
@@ -227,9 +228,7 @@ namespace cairo {
         for (int i = 0; i < waiting_conns_count; i++) {
             if (events[i].events & EPOLLERR) {
                 // TODO: Check properly this event
-                std::stringstream ss{};
-                ss << "epoll_wait returned EPOLLERR: " << strerror(errno) << ".\n";
-                throw std::runtime_error(ss.str());
+                throw std::runtime_error("epoll_wait returned EPOLLERR");
             }
 
             if (m_accepted_conns.size() == m_config.max_number_of_fds) {
@@ -243,9 +242,7 @@ namespace cairo {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     std::cout << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.\n";
                 } else {
-                    std::stringstream ss{};
-                    ss << "Accepting new connection failed: " << strerror(errno) << ".\n";
-                    throw std::runtime_error(ss.str());
+                    throw std::runtime_error("Accepting new connection failed");
                 }
             }
 
@@ -255,15 +252,14 @@ namespace cairo {
         return m_accepted_conns.size() - original_conns_count;
     }
 
-    // TODO: Remove timeout
     std::shared_ptr<TCPStream> TCPListener::accept() {
         if (m_listener_sockfd <= 0) {
-            std::runtime_error("Listening socket was not initialized.");
+            throw std::runtime_error("Listening socket was not initialized.");
         }
 
         // Lazily initialize thread waiting for epoll events
         if (auto lock = std::lock_guard<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
-            m_epoll_thread = std::thread(&TCPListener::start_epoll_listener, this);
+            m_epoll_thread = std::thread(&TCPListener::run_epoll_listener, this);
         }
         
         // Take new connection from the queue of accepted connections

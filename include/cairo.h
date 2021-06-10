@@ -62,7 +62,7 @@ namespace cairo {
             void shutdown();
 
         private:
-            void start_epoll_listener();
+            void run_epoll_listener();
 
             int process_waiting_connections(struct epoll_event* events, int waiting_conns_count);
 
