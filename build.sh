@@ -1,0 +1,1 @@
+cmake -D CMAKE_CXX_COMPILER=g++-10 -D CMAKE_C_COMPILER=gcc-10 ..

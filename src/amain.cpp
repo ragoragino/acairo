@@ -4,13 +4,13 @@
 #include <string>
 #include <csignal>
 
-#include <cairo.h>
+#include <acairo.h>
 
 volatile sig_atomic_t sig_flag = 0;
 
-void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
+acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     try {
-        std::vector<char> vector_received_message = stream->read(27);
+        std::vector<char> vector_received_message = co_await stream->read(27);
 
         std::string received_message(vector_received_message.begin(), vector_received_message.end());
         
@@ -18,7 +18,7 @@ void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
 
         const std::string send_message = "Just nod if you can hear me!";
         std::vector<char> vector_message(send_message.begin(), send_message.end());
-        stream->write(std::move(vector_message));
+        co_await stream->write(std::move(vector_message));
 
         std::cout << "Writing to socket was successful." << "\n"; 
     } catch (const std::exception& e){
@@ -27,12 +27,17 @@ void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
 }
 
 int main(){
-    using namespace cairo;
+    using namespace acairo;
 
     using namespace std::chrono_literals;
 
-    ExecutorConfiguration executor_config{
+    SchedulerConfiguration scheduler_config{
         number_of_worker_threads: 10,
+    };
+
+    ExecutorConfiguration executor_config{
+       scheduler_config: scheduler_config,
+       max_number_of_fds: 1024,
     };
 
     TCPStreamConfiguration tcpstream_configuration{
@@ -46,8 +51,8 @@ int main(){
         max_number_of_queued_conns: 1024,
     };
 
-    Executor executor(executor_config);
-    TCPListener listener(tcplistener_config);
+    auto executor = std::make_shared<Executor>(executor_config);
+    TCPListener listener(tcplistener_config, executor);
 
     // https://www.informit.com/articles/article.aspx?p=2204014
     if (std::signal(SIGINT, [](int) -> void {
@@ -66,7 +71,7 @@ int main(){
 
         listener.shutdown();
 
-        executor.stop();
+        executor->stop();
     });
 
     listener.bind("127.0.0.1:8080");
@@ -77,8 +82,8 @@ int main(){
 
             auto handler = std::bind(handle_socket, std::move(stream));
 
-            executor.spawn(Handler(std::move(handler)));
-        } catch(const cairo::TCPListenerStoppedError& e) {
+            executor->spawn(std::move(handler));
+        } catch(const TCPListenerStoppedError& e) {
             if (sig_flag == 1) {
                 break;
             }

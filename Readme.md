@@ -1,7 +1,13 @@
-#### Handle thread exceptions
-#### Proper logging library
+#### TODO: Handle thread exceptions
+#### Proper logging library (mainly thread-safe)
 
-1. Compiler creates promise object on the stack of the coroutine
-2. promise.get_return_object() returns the resumable objects (return object of the coroutine)
+#### Best materials
+- https://blog.panicsoftware.com/co_awaiting-coroutines/
+- https://lewissbaker.github.io/2017/11/17/understanding-operator-co-await
+- https://gitlab.com/deus_ex_machina399/coroutine-async/blob/master/lib/include/async/Future.h
+- https://www.dwcomputersolutions.net/posts/coroutines5/
 
-resumable -> created from promise_type (resumable defines promise_type) -> coroutine_handle (holds coroutine state) takes promise_type as template
+
+
+
+

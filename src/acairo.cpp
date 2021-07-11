@@ -16,14 +16,28 @@
 // Use (void) to silent unused warnings.
 #define assertm(exp, msg) assert(((void)msg, exp))
 
-#include "cairo.h"
+#include "acairo.h"
 
-namespace cairo {
-    // Create an error message containing stringified errno
+namespace acairo {
     std::string error_with_errno(const std::string& message){
         std::stringstream ss{};
         ss << message << ": " << strerror(errno) << ".\n";
         return ss.str();
+    }
+
+    std::ostream& operator<<(std::ostream& os, const EVENT_TYPE& event_type) {
+        switch (event_type) {
+            case EVENT_TYPE::IN:
+                os << "IN";
+                break;
+            case EVENT_TYPE::OUT:
+                os << "OUT";
+                break;
+            default:
+                os << uint8_t(event_type);
+        }
+
+        return os;
     }
 
     // Retry syscalls on EINTR
@@ -75,7 +89,151 @@ namespace cairo {
         }
     }
 
-    std::vector<char> TCPStream::read(size_t number_of_bytes) {
+    void Scheduler::spawn(Scheduler::WorkUnit&& work_unit) {
+        {
+            std::lock_guard<std::mutex> lock(m_work_queue_mutex);
+            m_work_queue.push(std::move(work_unit));
+        }
+
+        m_work_queue_cv.notify_one();
+    };
+
+    void Scheduler::stop() {
+        m_stopped = true;
+        m_work_queue_cv.notify_all();
+
+        for (auto& worker : m_threadPool) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void Scheduler::start_worker() {
+        while (!m_stopped) {
+            auto work_unit = this->get_new_work_unit();
+
+            try {
+                if (work_unit) {
+                    work_unit->operator()();
+                    std::cout << "Successfully finished work unit: " << work_unit->get_id() << "\n";
+                }
+            } catch(const std::exception& e) {
+                std::cout << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << "\n";
+                work_unit->set_exception(std::current_exception());
+            }
+        }
+    }
+
+    std::optional<Scheduler::WorkUnit> Scheduler::get_new_work_unit() {
+        std::unique_lock<std::mutex> lock(m_work_queue_mutex);
+
+        if (m_work_queue.size() == 0) {
+            m_work_queue_cv.wait(lock, [this]{ return m_work_queue.size() > 0 || m_stopped; });
+            if (m_stopped) {
+                return {};
+            }
+        }
+
+        auto work_unit = m_work_queue.front();
+        m_work_queue.pop();
+
+        return work_unit;
+    }
+
+
+    Executor::Executor(const ExecutorConfiguration& config) 
+    : m_scheduler(std::make_unique<Scheduler>(config.scheduler_config))
+    , m_config(config) {
+        m_epoll_fd = epoll_create1(0);
+        if (m_epoll_fd < 0) {
+            throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
+        }
+
+        m_epoll_thread = std::thread(&Executor::run_epoll_listener, this);
+    }
+
+    void Executor::register_event_handler(int fd, EVENT_TYPE event_type, std::function<void()>&& h) {
+        auto socket_event_key = SocketEventKey{
+            fd: fd,
+            event_type: event_type,
+        };
+
+        std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+        
+        // If there is a coroutine waiting for the fd,
+        // it must have been already registered with epoll.
+        // Otherwise, register it.
+        if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {   
+            struct epoll_event accept_event;
+            accept_event.events = get_epoll_event_type(socket_event_key.event_type);
+            if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
+                // TODO: Make sure throwing here is ok.
+                throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
+            }
+        }
+
+        m_coroutines_map[socket_event_key].push_back(Scheduler::WorkUnit(std::move(h)));
+    }
+
+    void Executor::run_epoll_listener() {
+        struct epoll_event* events = (struct epoll_event*)calloc(m_config.max_number_of_fds, 
+            sizeof(struct epoll_event));
+        if (events == NULL) {
+            throw std::runtime_error("Unable to allocate memory for epoll_events");
+        }
+
+        while (!m_stopped) {
+            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events, m_config.max_number_of_fds, 100);
+            if (count_of_ready_fds < 0) {
+                throw std::runtime_error("Waititing for epoll_events failed");
+            }
+
+            std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+            for (int i = 0; i < count_of_ready_fds; i++) {
+                if (events[i].events & EPOLLERR) {
+                    // TODO: Check properly this event
+                    throw std::runtime_error("epoll_wait returned EPOLLERR");
+                }
+
+                // EPOLLHUP detects peer-closed sockets
+                if (events[i].events & EPOLLIN || events[i].events & EPOLLHUP) {
+                    SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::IN};
+                    auto& tasks = m_coroutines_map[event_key];
+                    for (auto it = tasks.begin(); it != tasks.end(); it++) {
+                        m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
+                    }
+
+                    tasks.clear();
+                }
+
+                if (events[i].events & EPOLLOUT || events[i].events & EPOLLHUP) {
+                    SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::OUT};
+                    auto& tasks = m_coroutines_map[event_key];
+                    for (auto it = tasks.begin(); it != tasks.end(); it++) {
+                        m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
+                    }
+
+                    tasks.clear();
+                }
+            }
+        }
+    }
+
+    int Executor::get_epoll_event_type(EVENT_TYPE event_type) {
+        switch (event_type) {
+            case EVENT_TYPE::IN:
+                return EPOLLIN;
+            case EVENT_TYPE::OUT:
+                return EPOLLOUT;
+            default:
+                std::stringstream ss;
+                ss << "Unrecognized waiting event type: " << event_type << "\n";
+                throw std::runtime_error(ss.str());
+        }
+    }
+
+    acairo::Task<std::vector<char>> TCPStream::read(size_t number_of_bytes) {
         using namespace std::chrono_literals;
 
         std::vector<char> result(number_of_bytes, 0);
@@ -87,8 +245,7 @@ namespace cairo {
             const int number_of_bytes_written = retry_sys_call(::read, m_fd, (void*)current_buffer_ptr, remaining_buffer_size);
             if (number_of_bytes_written < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // TODO: Remove when async
-                    std::this_thread::sleep_for(100ms);
+                    co_await ReadFuture(m_executor, m_fd);
                     continue;
                 }
 
@@ -99,10 +256,10 @@ namespace cairo {
             current_buffer_ptr += number_of_bytes_written;
         }
         
-        return result;
+        co_return result;
     }
 
-    void TCPStream::write(std::vector<char>&& buffer) {
+    acairo::Task<void> TCPStream::write(std::vector<char>&& buffer) {
         using namespace std::chrono_literals;
 
         int remaining_buffer_size = buffer.size();
@@ -112,8 +269,7 @@ namespace cairo {
             const int number_of_bytes_written = retry_sys_call(::write, m_fd, (void*)current_buffer_ptr, remaining_buffer_size);
             if (number_of_bytes_written < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // TODO: Remove when async
-                    std::this_thread::sleep_for(100ms);
+                    co_await WriteFuture(m_executor, m_fd);
                     continue;
                 }
 
@@ -124,7 +280,7 @@ namespace cairo {
             current_buffer_ptr += number_of_bytes_written;
         }
         
-        return;
+        co_return;
     }
 
     TCPStream::~TCPStream(){
@@ -278,9 +434,9 @@ namespace cairo {
 
         std::cout << "Creating TCPStream from fd: " << accepted_conn_fd << "\n";
         
-        // TODO: Add later
-        // set_non_blocking_on_socket(newsockfd);
-        return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd);   
+        make_socket_non_blocking(accepted_conn_fd);
+        
+        return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd, m_executor);   
     }
 
     void TCPListener::shutdown() {
@@ -291,57 +447,5 @@ namespace cairo {
         if (m_epoll_thread.joinable()) {
             m_epoll_thread.join();
         }
-    }
-
-    void Executor::spawn(Handler&& handler) {
-        {
-            std::lock_guard<std::mutex> lock(m_work_queue_mutex);
-            m_work_queue.push(std::move(handler));
-        }
-
-        m_work_queue_cv.notify_one();
-    };
-
-    void Executor::stop() {
-        m_stopped = true;
-        m_work_queue_cv.notify_all();
-
-        for (auto& worker : m_threadPool) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-    void Executor::start_worker() {
-        while (!m_stopped) {
-            auto work_unit = this->get_new_work_unit();
-
-            try {
-                if (work_unit) {
-                    work_unit->operator()();
-                    std::cout << "Successfully finished work unit: " << work_unit->get_id() << "\n";
-                }
-            } catch(const std::exception& e) {
-                std::cout << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << "\n";
-                work_unit->set_exception(std::current_exception());
-            }
-        }
-    }
-
-    std::optional<Handler> Executor::get_new_work_unit() {
-        std::unique_lock<std::mutex> lock(m_work_queue_mutex);
-
-        if (m_work_queue.size() == 0) {
-            m_work_queue_cv.wait(lock, [this]{ return m_work_queue.size() > 0 || m_stopped; });
-            if (m_stopped) {
-                return {};
-            }
-        }
-
-        auto work_unit = m_work_queue.front();
-        m_work_queue.pop();
-
-        return work_unit;
     }
 }

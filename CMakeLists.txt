@@ -5,10 +5,9 @@ FIND_PACKAGE(Threads REQUIRED)
 
 SET(CPP_STANDARD 20)
 
-SET(GCC_COVERAGE_COMPILE_FLAGS "-fcoroutines")
-SET(CMAKE_CXX_FLAGS "-std=c++1z -Wall -Wextra -Werror")
+SET(CMAKE_CXX_FLAGS "-std=c++1z -Wall -Wextra -Werror -fcoroutines")
 
-ADD_LIBRARY(cairo STATIC "src/cairo.cpp")
+ADD_LIBRARY(cairo STATIC "src/cairo.cpp" "src/acairo.cpp")
 
 TARGET_LINK_LIBRARIES(cairo PRIVATE Threads::Threads)
 
@@ -26,7 +25,8 @@ TARGET_LINK_LIBRARIES(cairomain
     PRIVATE cairo
 )
 
-# https://thomastrapp.com/blog/signal-handler-for-multithreaded-c++/
-# https://cafbit.com/post/tokio_internals/
-# https://cor3ntin.github.io/posts/executors/
-# https://www.modernescpp.com/index.php/a-short-detour-executors
+ADD_EXECUTABLE(acairomain "src/amain.cpp")
+
+TARGET_LINK_LIBRARIES(acairomain 
+    PRIVATE cairo
+)
