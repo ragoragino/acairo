@@ -7,6 +7,7 @@
 #include <cairo.h>
 
 volatile sig_atomic_t sig_flag = 0;
+volatile sig_atomic_t force_shutdown = 0;
 
 void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
     try {
@@ -57,8 +58,8 @@ int main(){
         exit(1);
     }
 
-    auto shutdownHandler = std::thread([&](){
-        while (sig_flag == 0) {
+    auto shutdown_handler = std::thread([&](){
+        while (sig_flag == 0  && force_shutdown == 0) {
             std::this_thread::sleep_for(500ms);
         }
 
@@ -83,11 +84,14 @@ int main(){
                 break;
             }
 
+            force_shutdown = 1;
+            shutdown_handler.join();
+
             throw;
         }
     }
 
-    shutdownHandler.join();
+    shutdown_handler.join();
 
     return 0;
 }

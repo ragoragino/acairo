@@ -38,7 +38,8 @@ namespace std {
     struct hash<acairo::SocketEventKey>
     {
         std::size_t operator()(const acairo::SocketEventKey& k) const {
-            return (std::hash<int>()(k.fd));
+            static auto hasher = std::hash<int>();
+            return hasher(k.fd);
         }
     };
 }
@@ -63,9 +64,13 @@ namespace acairo {
         public:
             class WorkUnit {
                 public:
-                    explicit WorkUnit(std::function<void()>&& work_unit) 
+                    explicit WorkUnit(const std::function<void()>& work_unit) 
                     : m_id(WorkUnit::generate_id())
                     , m_work_unit(work_unit) {}
+
+                    explicit WorkUnit(std::function<void()>&& work_unit) 
+                    : m_id(WorkUnit::generate_id())
+                    , m_work_unit(std::move(work_unit)) {}
 
                     uint64_t get_id() {
                         return m_id;
@@ -88,7 +93,7 @@ namespace acairo {
                         return distrib(gen);
                     }
 
-                    uint64_t m_id;
+                    const uint64_t m_id;
 
                     std::function<void()> m_work_unit;
                     std::exception_ptr m_exception_ptr;
@@ -143,7 +148,8 @@ namespace acairo {
                 m_scheduler->spawn(Scheduler::WorkUnit(std::move(work_unit)));
             }
 
-            void register_event_handler(int fd, EVENT_TYPE event_type, std::function<void()>&& h);
+            template<typename Callable>
+            void register_event_handler(int fd, EVENT_TYPE event_type, Callable&& callable);
 
             void stop() {
                 m_stopped = true;
@@ -372,7 +378,7 @@ namespace acairo {
 
             // By await_transform we transform awaitables - one signature is used to obtain just awaiters holding
             // instances of classes deriving from Future interface. The other signature is used for all other
-            // objects that need to define co_await operators to obtain Awaiters (e.g. like Task class)
+            // objects that need to define co_await operators to obtain Awaiters (e.g. like the Task class).
             template <typename FutureType>
             typename std::enable_if<std::is_base_of<Future, FutureType>::value, FutureAwaiter<FutureType>>::type
             await_transform(FutureType&& future) {

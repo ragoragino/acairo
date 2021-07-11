@@ -153,7 +153,8 @@ namespace acairo {
         m_epoll_thread = std::thread(&Executor::run_epoll_listener, this);
     }
 
-    void Executor::register_event_handler(int fd, EVENT_TYPE event_type, std::function<void()>&& h) {
+    template<typename Callable>
+    void Executor::register_event_handler(int fd, EVENT_TYPE event_type, Callable&& callable) {
         auto socket_event_key = SocketEventKey{
             fd: fd,
             event_type: event_type,
@@ -173,7 +174,7 @@ namespace acairo {
             }
         }
 
-        m_coroutines_map[socket_event_key].push_back(Scheduler::WorkUnit(std::move(h)));
+        m_coroutines_map[socket_event_key].push_back(Scheduler::WorkUnit(std::forward<Callable>(callable)));
     }
 
     void Executor::run_epoll_listener() {
@@ -216,6 +217,8 @@ namespace acairo {
 
                     tasks.clear();
                 }
+
+                // TODO: When to delete the fd from epoll's interest list?
             }
         }
     }

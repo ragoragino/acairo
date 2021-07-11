@@ -1,5 +1,6 @@
 #### TODO: Handle thread exceptions
-#### Proper logging library (mainly thread-safe)
+#### TODO: Proper logging library (mainly thread-safe)
+#### TODO: When to remove fd from the epoll interest list?
 
 #### Best materials
 - https://blog.panicsoftware.com/co_awaiting-coroutines/
