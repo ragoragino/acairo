@@ -151,6 +151,8 @@ namespace acairo {
             template<typename Callable>
             void register_event_handler(int fd, EVENT_TYPE event_type, Callable&& callable);
 
+            void deregister_fd(int fd);
+
             void stop() {
                 m_stopped = true;
 
@@ -361,10 +363,12 @@ namespace acairo {
             approach when you have full control over who/what calls resume().
             */
             void unhandled_exception() {
-                auto exceptionPtr = std::current_exception();
-                if (exceptionPtr) {
-                    //TODO: 
-                } 
+                auto exception_ptr = std::current_exception();
+                try {
+                    std::rethrow_exception(exception_ptr);
+                } catch (const std::exception& e) {
+                    std::cout << "Coroutine handle failed with an exception: " << e.what() << "\n";
+                }
             }
 
             // Not thread-safe. This should be always running synchronously with get_continuation.

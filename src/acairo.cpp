@@ -54,6 +54,16 @@ namespace acairo {
         }
     }
 
+    void log_socket_error(int fd) {
+        int error = 0;
+        socklen_t errlen = sizeof(error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
+            std::cout << error_with_errno("Error occured on a socket: ");
+        } else {
+            std::cout << "Error occured on a socket, but unable to get socket error.\n";
+        }
+    }
+
     // Split listening address to an IP address and port 
     // (default port being 80 and address 127.0.0.1)
     std::pair<std::string, int> split_address(const std::string& full_address) {
@@ -169,7 +179,7 @@ namespace acairo {
             struct epoll_event accept_event;
             accept_event.events = get_epoll_event_type(socket_event_key.event_type);
             if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
-                // TODO: Make sure throwing here is ok.
+                log_socket_error(m_epoll_fd);
                 throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
             }
         }
@@ -184,42 +194,59 @@ namespace acairo {
             throw std::runtime_error("Unable to allocate memory for epoll_events");
         }
 
+        auto schedule_ready_tasks = [this](const SocketEventKey& event_key){
+            auto& tasks = m_coroutines_map[event_key];
+            for (auto it = tasks.begin(); it != tasks.end(); it++) {
+                m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
+            }
+
+            tasks.clear();
+        };
+
         while (!m_stopped) {
             int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events, m_config.max_number_of_fds, 100);
             if (count_of_ready_fds < 0) {
+                log_socket_error(m_epoll_fd);
                 throw std::runtime_error("Waititing for epoll_events failed");
             }
 
             std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
             for (int i = 0; i < count_of_ready_fds; i++) {
+                // In case of a socket error, let the handlers finish their work
                 if (events[i].events & EPOLLERR) {
-                    // TODO: Check properly this event
-                    throw std::runtime_error("epoll_wait returned EPOLLERR");
-                }
+                    log_socket_error(events[i].data.fd);
 
-                // EPOLLHUP detects peer-closed sockets
-                if (events[i].events & EPOLLIN || events[i].events & EPOLLHUP) {
+                    SocketEventKey event_key_in{events[i].data.fd, EVENT_TYPE::IN};
+                    schedule_ready_tasks(event_key_in);
+
+                    SocketEventKey event_key_out{events[i].data.fd, EVENT_TYPE::OUT};
+                    schedule_ready_tasks(event_key_out);
+
+                    continue;
+                }
+               
+                // EPOLLIN and EPOLLOUT should be also called when the peer closed that end of the socket.
+                // Therefore, it doesn't seem that we need to handle any special events connected
+                // with unexpected peer socket shutdown here.
+                if (events[i].events & EPOLLIN) {
                     SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::IN};
-                    auto& tasks = m_coroutines_map[event_key];
-                    for (auto it = tasks.begin(); it != tasks.end(); it++) {
-                        m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
-                    }
-
-                    tasks.clear();
+                    schedule_ready_tasks(event_key);
                 }
 
-                if (events[i].events & EPOLLOUT || events[i].events & EPOLLHUP) {
+                if (events[i].events & EPOLLOUT) {
                     SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::OUT};
-                    auto& tasks = m_coroutines_map[event_key];
-                    for (auto it = tasks.begin(); it != tasks.end(); it++) {
-                        m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
-                    }
-
-                    tasks.clear();
+                    schedule_ready_tasks(event_key);
                 }
-
-                // TODO: When to delete the fd from epoll's interest list?
             }
+        }
+    }
+
+    void Executor::deregister_fd(int fd){
+        // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
+        // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
+        if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
+            log_socket_error(m_epoll_fd);
+            throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
         }
     }
 
@@ -286,11 +313,21 @@ namespace acairo {
         co_return;
     }
 
-    TCPStream::~TCPStream(){
-        // Close shouldn't block on non-blocking sockets
+    TCPStream::~TCPStream() {
+        // Deregistering a fd can throw, so in case it throws we just log the error and return
+        // as there is not much we can do about it and we (probably?) want the program to continue
+        try {
+            m_executor->deregister_fd(m_fd);
+        } catch(const std::exception& e){
+            std::cout << "Unable to deregister fd: " << e.what() << ".\n";
+            return;
+        }
+
+        // close shouldn't block on non-blocking sockets
         int result = retry_sys_call(::close, m_fd);
         if (result < 0) {
             std::cout << "Unable to close file descriptor: " << strerror(errno) << ".\n";
+            return;
         }
     }
 
@@ -338,6 +375,7 @@ namespace acairo {
         struct epoll_event accept_event;
         accept_event.events = EPOLLIN;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, m_listener_sockfd, &accept_event) < 0) {
+            log_socket_error(epoll_fd);
             throw std::runtime_error(error_with_errno("Unable to add listener socket to the epoll interest list"));
         }
 
@@ -365,6 +403,7 @@ namespace acairo {
 
             int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, m_config.max_number_of_fds, 100);
             if (count_of_ready_fds < 0) {
+                log_socket_error(epoll_fd);
                 throw std::runtime_error("Waititing for epoll_events failed");
             }
 
@@ -386,8 +425,8 @@ namespace acairo {
 
         for (int i = 0; i < waiting_conns_count; i++) {
             if (events[i].events & EPOLLERR) {
-                // TODO: Check properly this event
-                throw std::runtime_error("epoll_wait returned EPOLLERR");
+                log_socket_error(events[i].data.fd);
+                continue;
             }
 
             if (m_accepted_conns.size() == m_config.max_number_of_fds) {
