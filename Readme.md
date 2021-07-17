@@ -1,5 +1,5 @@
 #### TODO: Handle thread exceptions
-#### TODO: Proper logging library (mainly thread-safe)
+#### TODO: Proper logging library (mainly thread-safe) + improve logging!
 
 #### Best materials
 - https://blog.panicsoftware.com/co_awaiting-coroutines/

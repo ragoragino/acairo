@@ -142,7 +142,11 @@ namespace acairo {
             void spawn(Callable&& callable) {
                 auto work_unit = [callable = std::move(callable)](){
                     auto task = callable();
-                    // TODO: task.detach();
+
+                    // By detaching the task, we don't destruct the coroutine handle
+                    // The coroutine handle will be automatically destructed when co_return
+                    // will be called
+                    task.detach();
                 };
 
                 m_scheduler->spawn(Scheduler::WorkUnit(std::move(work_unit)));
@@ -159,6 +163,8 @@ namespace acairo {
                 if (m_epoll_thread.joinable()) {
                     m_epoll_thread.join();
                 }
+
+                m_scheduler->stop();
             }
 
         private:
@@ -228,7 +234,7 @@ namespace acairo {
             }
 
             void await_suspend(std::coroutine_handle<> handle) const noexcept {
-                auto continuationHandle = [handle]() mutable {
+                auto continuation_handle = [handle]() mutable {
                     handle.resume();
                 };
 
@@ -244,7 +250,7 @@ namespace acairo {
                 object because both could already be destroyed. In general, the only things that are safe to access 
                 after the operation is started and the coroutine is scheduled for resumption are local variables within await_suspend().
                 */
-                executor->register_event_handler(fd, event_type, std::move(continuationHandle));
+                executor->register_event_handler(fd, event_type, std::move(continuation_handle));
             }
 
             void await_resume() const noexcept {}
@@ -286,7 +292,7 @@ namespace acairo {
         public:
             using promise_type = Promise<T>;
 
-            Task(std::coroutine_handle<promise_type> handle) 
+            Task(std::coroutine_handle<promise_type> handle)
                 : m_handle(handle) { }
 
             Task(Task&) = delete;
@@ -300,13 +306,20 @@ namespace acairo {
             bool done() const {
                 return m_handle.done();
             }
+
+            void detach() {
+                m_handle.promise().set_detached(true);
+                m_handle = std::coroutine_handle<promise_type>();
+            }
             
             TaskAwaiter<T> operator co_await() noexcept {
                 return TaskAwaiter<T> { m_handle };
             }
 
             ~Task() { 
-                m_handle.destroy(); 
+                if (m_handle) {
+                    m_handle.destroy(); 
+                }
             }
 
         private:
@@ -314,22 +327,28 @@ namespace acairo {
     };
 
    // Waits during final_suspend of the promise for the resumption of continuations
+   // Allows to be always ready in case it is tied with the last promise in a chain of promises
     template<typename T>
-    struct ContinuationAwaiter {
-        ContinuationAwaiter() = default;
-        
-        bool await_ready() const noexcept { 
-            return false; 
-        }
-
-        void await_suspend(std::coroutine_handle<Promise<T>> handle) const noexcept {
-            auto continuation = handle.promise().get_continuation();
-            if (continuation && !continuation.done()) {
-                continuation.resume();
+    class ContinuationAwaiter {
+        public:
+            ContinuationAwaiter(bool m_always_ready = false) 
+                : m_always_ready(m_always_ready) {};
+            
+            bool await_ready() const noexcept { 
+                return m_always_ready; 
             }
-        }
 
-        void await_resume() const noexcept {}
+            void await_suspend(std::coroutine_handle<Promise<T>> handle) const noexcept {
+                auto continuation = handle.promise().get_continuation();
+                if (continuation && !continuation.done()) {
+                    continuation.resume();
+                }
+            }
+
+            void await_resume() const noexcept {}
+        
+        private:
+            const bool m_always_ready;
     };
 
     // https://devblogs.microsoft.com/oldnewthing/20210330-00/?p=105019
@@ -349,7 +368,7 @@ namespace acairo {
 
             // Resume a coroutine that have been chained after the source coroutine
             ContinuationAwaiter<T> final_suspend() noexcept { 
-                return ContinuationAwaiter<T>{}; 
+                return ContinuationAwaiter<T>(m_detached); 
             }
 
             // https://lewissbaker.github.io/2018/09/05/understanding-the-promise-type
@@ -380,6 +399,10 @@ namespace acairo {
                 return m_continuation;
             }
 
+            void set_detached(bool detached) noexcept {
+                m_detached = detached;
+            }
+
             // By await_transform we transform awaitables - one signature is used to obtain just awaiters holding
             // instances of classes deriving from Future interface. The other signature is used for all other
             // objects that need to define co_await operators to obtain Awaiters (e.g. like the Task class).
@@ -396,6 +419,7 @@ namespace acairo {
             }
 
         private:
+            bool m_detached;
             std::coroutine_handle<> m_continuation;
    };
 

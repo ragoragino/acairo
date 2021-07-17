@@ -73,9 +73,13 @@ int main(){
         listener.shutdown();
 
         executor->stop();
+
+        std::cout << "Executor stopped\n";
     });
 
     listener.bind("127.0.0.1:8080");
+
+    std::cout << "Starting to accept new connections.\n";
 
     while(true) {
         try { 

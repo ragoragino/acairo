@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	numberOfWorkers := 1000
+	numberOfWorkers := 1
 	tcpAddressStr := "localhost:8080"
 	message := "Is there anybody out there?"
 	errChannel := make(chan error, numberOfWorkers)
