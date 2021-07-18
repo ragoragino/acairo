@@ -130,7 +130,6 @@ namespace acairo {
                 }
             } catch(const std::exception& e) {
                 std::cout << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << "\n";
-                work_unit->set_exception(std::current_exception());
             }
         }
     }
@@ -150,7 +149,6 @@ namespace acairo {
 
         return work_unit;
     }
-
 
     Executor::Executor(const ExecutorConfiguration& config) 
     : m_scheduler(std::make_unique<Scheduler>(config.scheduler_config))
@@ -172,17 +170,15 @@ namespace acairo {
 
         std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
         
-        // If there is a coroutine waiting for the fd,
-        // it must have been already registered with epoll.
+        // If there is a coroutine waiting for the fd, it must have been already registered with epoll.
         // Otherwise, register it.
         if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {  
             // We need an edge-triggered notifications as we will be invoking handlers based on incoming events 
             struct epoll_event accept_event;
             accept_event.events = get_epoll_event_type(socket_event_key.event_type) | EPOLLET;
             accept_event.data.fd = socket_event_key.fd;
-            if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
-                log_socket_error(m_epoll_fd);
-                throw std::runtime_error("Unable to add new socket to the epoll interest list");
+            if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
+                throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
             }
         }
 
@@ -206,10 +202,10 @@ namespace acairo {
         };
 
         while (!m_stopped) {
-            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events, m_config.max_number_of_fds, 100);
+            // TODO: Make epoll_wait waiting time configurable
+            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events, m_config.max_number_of_fds, 10);
             if (count_of_ready_fds < 0) {
-                log_socket_error(m_epoll_fd);
-                throw std::runtime_error("Waititing for epoll_events failed");
+                throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
             }
 
             std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
@@ -287,9 +283,8 @@ namespace acairo {
         if (fd_was_registered) {
             // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
             // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
-            if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-                log_socket_error(m_epoll_fd);
-                throw std::runtime_error("Unable to deregister fd from the epoll interest list");
+            if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_DEL, fd, (struct epoll_event *)nullptr) < 0) {
+                throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
             }
         }
     }
@@ -330,7 +325,6 @@ namespace acairo {
             current_buffer_ptr += number_of_bytes_written;
         }
         
-        // TODO: What to do when the read does not block!
         co_return result;
     }
 
@@ -354,14 +348,12 @@ namespace acairo {
             remaining_buffer_size -= number_of_bytes_written;
             current_buffer_ptr += number_of_bytes_written;
         }
-        
-        co_return;
     }
 
     TCPStream::~TCPStream() {
         std::cout << "Destructing fd: " << m_fd << "\n";
 
-        // Deregistering a fd can throw, so in case it throws we just log the error and continuie
+        // Deregistering a fd can throw, so in case it throws we just log the error and continue
         // as there is not much we can do about it and we (probably?) want the program to continue
         try {
             m_executor->deregister_fd(m_fd);
@@ -420,7 +412,6 @@ namespace acairo {
         struct epoll_event accept_event;
         accept_event.events = EPOLLIN;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, m_listener_sockfd, &accept_event) < 0) {
-            log_socket_error(epoll_fd);
             throw std::runtime_error(error_with_errno("Unable to add listener socket to the epoll interest list"));
         }
 
@@ -442,14 +433,13 @@ namespace acairo {
             
             if (consumers_throttled) {
                 // TODO: Make this configurable
-                std::this_thread::sleep_for(100ms); 
+                std::this_thread::sleep_for(50ms); 
                 continue;
             }
 
             int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, m_config.max_number_of_fds, 100);
             if (count_of_ready_fds < 0) {
-                log_socket_error(epoll_fd);
-                throw std::runtime_error("Waititing for epoll_events failed");
+                throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
             }
 
             int processed_conns_count = process_waiting_connections(events, count_of_ready_fds);

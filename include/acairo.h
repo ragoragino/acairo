@@ -76,11 +76,6 @@ namespace acairo {
                         return m_id;
                     }
 
-                    // TODO: No one really uses this
-                    void set_exception(std::exception_ptr exception_ptr){
-                        m_exception_ptr = exception_ptr;
-                    }
-
                     void operator()(){
                         m_work_unit();
                     }
@@ -97,7 +92,6 @@ namespace acairo {
                     const uint64_t m_id;
 
                     std::function<void()> m_work_unit;
-                    std::exception_ptr m_exception_ptr;
             };
 
             Scheduler(const SchedulerConfiguration& config) 
@@ -145,11 +139,11 @@ namespace acairo {
                     auto task = callable();
 
                     // By setting final flag on this task, we don't destruct the coroutine 
-                    // handle right away as this would cause the whole coroutine to be useless.
-                    // The coroutine handle will be automatically destructed when co_return
-                    // will be called.
+                    // handle right away as this would cause the whole coroutine to stop further 
+                    // resumptions. However, we are not leaking coroutine frames, as they will be
+                    //  automatically destructed when coroutines finish (i.e. co_return will be called).
                     // The only exception is when the coroutine has already finished. In that case,
-                    // this call should have no effect, as the coroutine should be already destructed.
+                    // this call should have no effect, as the coroutine frame should be already destroyed.
                     task.make_final();
                 };
 
@@ -191,9 +185,7 @@ namespace acairo {
     class Future {
         public:
             Future(std::shared_ptr<Executor> executor, int fd_in, EVENT_TYPE event_in) 
-            : m_executor(executor), m_fd(fd_in), m_event_type(event_in) {
-                std::cout << "Creating future: " << m_fd << " and " << m_event_type << "\n";
-            }
+            : m_executor(executor), m_fd(fd_in), m_event_type(event_in) { }
 
             std::shared_ptr<Executor> get_executor() const noexcept {
                 return m_executor;
@@ -228,8 +220,10 @@ namespace acairo {
             : Future(executor, fd_in, EVENT_TYPE::OUT) {}
     };
 
-    // Awaits Future object
-    template<typename FutureType>
+    // Awaits Future object. Use enable_if_t to force that only classes derived from the Future class
+    // can be a template parameter of this class. 
+    template<typename FutureType, 
+        typename = typename std::enable_if_t<std::is_base_of<Future, FutureType>::value, FutureType>>
     class FutureAwaiter {
         public:
             FutureAwaiter(FutureType&& future_awaitable)
@@ -241,8 +235,6 @@ namespace acairo {
 
             void await_suspend(std::coroutine_handle<> handle) const noexcept {
                 auto continuation_handle = [handle]() mutable {
-                    std::cout << "Resuming coroutine.\n";
-
                     handle.resume();
                 };
 
@@ -251,7 +243,7 @@ namespace acairo {
                 int fd = m_future_awaitable.get_fd();
                 EVENT_TYPE event_type = m_future_awaitable.get_event_type();
 
-                std::cout << "Scheduling handler on fd " << fd << " and event " << event_type << ".\n";
+                std::cout << "Scheduling coroutine handler on fd " << fd << " and event " << event_type << ".\n";
 
                 // https://lewissbaker.github.io/2017/11/17/understanding-operator-co-await
                 /* 
@@ -296,7 +288,6 @@ namespace acairo {
             std::coroutine_handle<Promise<T>> m_handle;
     };
 
-    // TODO: Implement detaching
     template<typename T>
     struct Task {
         public:
@@ -317,7 +308,7 @@ namespace acairo {
             }
 
             void make_final() {
-                // Early return in case the coroutine has already finished.
+                // Return early in case the coroutine has already finished.
                 if (done()) {
                     return;
                 }
@@ -340,7 +331,7 @@ namespace acairo {
             std::coroutine_handle<promise_type> m_handle;
     };
 
-   // Waits during final_suspend of the promise for the resumption of continuations.
+   // ContinuationAwaiter waits during final_suspend of the promise for the resumption of continuations.
    // Allows to be always ready in case it is tied with the last promise in a chain of promises.
     template<typename T>
     class ContinuationAwaiter {
@@ -382,7 +373,7 @@ namespace acairo {
 
             // Resume a coroutine that have been chained after the source coroutine
             ContinuationAwaiter<T> final_suspend() noexcept {
-                // If the coroutine has already finished, we want the final awaiter to 
+                // If the coroutine's work has already finished, we want the final awaiter to 
                 // be always ready
                 if (m_is_return_value_set) {
                     ContinuationAwaiter<T>(true);
@@ -405,12 +396,9 @@ namespace acairo {
             approach when you have full control over who/what calls resume().
             */
             void unhandled_exception() {
+                // We decide to rethrow the exception as the scheduler catches all exceptions
                 auto exception_ptr = std::current_exception();
-                try {
-                    std::rethrow_exception(exception_ptr);
-                } catch (const std::exception& e) {
-                    std::cout << "Coroutine handle failed with an exception: " << e.what() << "\n";
-                }
+                std::rethrow_exception(exception_ptr);
             }
 
             // Not thread-safe. This should be always running synchronously with get_continuation.

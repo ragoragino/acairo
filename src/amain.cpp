@@ -25,8 +25,6 @@ acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     } catch (const std::exception& e){
         std::cout << "handle_socket failed: " << e.what() << "\n"; 
     }
-
-    co_return;
 }
 
 int main(){
