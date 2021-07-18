@@ -25,6 +25,8 @@ acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     } catch (const std::exception& e){
         std::cout << "handle_socket failed: " << e.what() << "\n"; 
     }
+
+    co_return;
 }
 
 int main(){
@@ -72,6 +74,8 @@ int main(){
 
         listener.shutdown();
 
+        std::cout << "Listener stopped.\n";
+
         executor->stop();
 
         std::cout << "Executor stopped\n";
@@ -85,7 +89,7 @@ int main(){
         try { 
             auto stream = listener.accept();
 
-            auto handler = std::bind(handle_socket, std::move(stream));
+            auto handler = std::bind(handle_socket, stream);
 
             executor->spawn(std::move(handler));
         } catch(const TCPListenerStoppedError& e) {
@@ -93,6 +97,11 @@ int main(){
                 break;
             }
 
+            force_shutdown = 1;
+            shutdown_handler.join();
+
+            throw;
+        } catch(const std::exception& e) {
             force_shutdown = 1;
             shutdown_handler.join();
 

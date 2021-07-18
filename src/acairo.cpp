@@ -175,12 +175,14 @@ namespace acairo {
         // If there is a coroutine waiting for the fd,
         // it must have been already registered with epoll.
         // Otherwise, register it.
-        if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {   
+        if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {  
+            // We need an edge-triggered notifications as we will be invoking handlers based on incoming events 
             struct epoll_event accept_event;
-            accept_event.events = get_epoll_event_type(socket_event_key.event_type);
+            accept_event.events = get_epoll_event_type(socket_event_key.event_type) | EPOLLET;
+            accept_event.data.fd = socket_event_key.fd;
             if (epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
                 log_socket_error(m_epoll_fd);
-                throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
+                throw std::runtime_error("Unable to add new socket to the epoll interest list");
             }
         }
 
@@ -229,11 +231,17 @@ namespace acairo {
                 // Therefore, it doesn't seem that we need to handle any special events connected
                 // with unexpected peer socket shutdown here.
                 if (events[i].events & EPOLLIN) {
+                    std::cout << "Adding handler for a fd " << events[i].data.fd << " and event_type " 
+                        << EVENT_TYPE::IN << " to the scheduler's queue.\n";
+
                     SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::IN};
                     schedule_ready_tasks(event_key);
                 }
 
                 if (events[i].events & EPOLLOUT) {
+                    std::cout << "Adding handler for a fd " << events[i].data.fd << " and event_type " 
+                        << EVENT_TYPE::OUT << " to the scheduler's queue.\n";
+
                     SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::OUT};
                     schedule_ready_tasks(event_key);
                 }
@@ -242,11 +250,47 @@ namespace acairo {
     }
 
     void Executor::deregister_fd(int fd){
-        // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
-        // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
-        if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-            log_socket_error(m_epoll_fd);
-            throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
+        bool fd_was_registered = false;
+
+        // Firstly remove all the registered handlers associated with the fd
+        {
+            std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+
+            auto socket_event_key = SocketEventKey{
+                fd: fd,
+                event_type: EVENT_TYPE::IN,
+            };
+
+            if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
+                fd_was_registered = true;
+
+                if (m_coroutines_map[socket_event_key].size() != 0) {
+                    std::cout << "In event handlers active while deregistering fd from epoll.\n";
+                }
+
+                m_coroutines_map.erase(socket_event_key);
+            }
+
+            socket_event_key.event_type = EVENT_TYPE::OUT;
+            if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
+                fd_was_registered = true;
+
+                if (m_coroutines_map[socket_event_key].size() != 0) {
+                    std::cout << "Out event handlers active while deregistering fd from epoll.\n";
+                }
+
+                m_coroutines_map.erase(socket_event_key);
+            };
+        }
+        
+        // We remove the fd from the epoll interest list if it was added there before
+        if (fd_was_registered) {
+            // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
+            // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
+            if (epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, fd, NULL) < 0) {
+                log_socket_error(m_epoll_fd);
+                throw std::runtime_error("Unable to deregister fd from the epoll interest list");
+            }
         }
     }
 
@@ -286,6 +330,7 @@ namespace acairo {
             current_buffer_ptr += number_of_bytes_written;
         }
         
+        // TODO: What to do when the read does not block!
         co_return result;
     }
 
@@ -314,20 +359,20 @@ namespace acairo {
     }
 
     TCPStream::~TCPStream() {
-        // Deregistering a fd can throw, so in case it throws we just log the error and return
+        std::cout << "Destructing fd: " << m_fd << "\n";
+
+        // Deregistering a fd can throw, so in case it throws we just log the error and continuie
         // as there is not much we can do about it and we (probably?) want the program to continue
         try {
             m_executor->deregister_fd(m_fd);
         } catch(const std::exception& e){
             std::cout << "Unable to deregister fd: " << e.what() << ".\n";
-            return;
         }
 
         // close shouldn't block on non-blocking sockets
         int result = retry_sys_call(::close, m_fd);
         if (result < 0) {
             std::cout << "Unable to close file descriptor: " << strerror(errno) << ".\n";
-            return;
         }
     }
 
