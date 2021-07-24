@@ -13,6 +13,8 @@
 #include <limits>
 #include <memory>
 
+#include "logger.hpp"
+
 namespace cairo {
     struct TCPListenerStoppedError : public std::exception {
         const char * what () const noexcept {
@@ -32,7 +34,8 @@ namespace cairo {
         public:
             TCPStream(const TCPStreamConfiguration& config, int fd) 
                 : m_fd(fd)
-                , m_config(config) {}
+                , m_config(config) 
+                , m_l(logger::Logger<>().WithPair("Component", "TCPStream").WithPair("fd", fd)) {}
 
             std::vector<char> read(size_t number_of_bytes);
 
@@ -43,6 +46,8 @@ namespace cairo {
         private:
             const int m_fd;
             const TCPStreamConfiguration m_config;
+
+            const logger::Logger<> m_l;
     };
 
     struct TCPListenerConfiguration {
@@ -55,7 +60,8 @@ namespace cairo {
         public:
             TCPListener(const TCPListenerConfiguration& config) 
                 : m_stopped(false)
-                , m_config(config) {}
+                , m_config(config)
+                , m_l(logger::Logger<>().WithPair("Component", "TCPStream")) {}
 
             void bind(const std::string& address);
 
@@ -79,6 +85,8 @@ namespace cairo {
             
             int m_listener_sockfd = 0;
             const TCPListenerConfiguration m_config;
+
+            const logger::Logger<> m_l;
     };
 
     struct ExecutorConfiguration {
@@ -124,7 +132,8 @@ namespace cairo {
             Executor(const ExecutorConfiguration& config) 
                 : m_threadPool(config.number_of_worker_threads)
                 , m_stopped(false)
-                , m_config(config) {
+                , m_config(config) 
+                , m_l(logger::Logger<>().WithPair("Component", "Executor")) {
                     for(std::uint8_t i = 0; i != m_config.number_of_worker_threads; i++) {
                         m_threadPool[i] = std::thread(&Executor::start_worker, this);
                     }
@@ -149,5 +158,7 @@ namespace cairo {
             std::condition_variable m_work_queue_cv;
 
             const ExecutorConfiguration m_config;
+
+            const logger::Logger<> m_l;
     };
 }

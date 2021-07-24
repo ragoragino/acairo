@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <coroutine>
 
+#include "logger.hpp"
+
 // SocketEventKey's hash template specialization must be defined before 
 // its first usage.
 namespace acairo {
@@ -97,7 +99,8 @@ namespace acairo {
             Scheduler(const SchedulerConfiguration& config) 
                 : m_threadPool(config.number_of_worker_threads)
                 , m_stopped(false)
-                , m_config(config) {
+                , m_config(config)
+                , m_l(logger::Logger<>().WithPair("Component", "Scheduler")) {
                     for(std::uint8_t i = 0; i != m_config.number_of_worker_threads; i++) {
                         m_threadPool[i] = std::thread(&Scheduler::start_worker, this);
                     }
@@ -122,6 +125,8 @@ namespace acairo {
             std::condition_variable m_work_queue_cv;
 
             const SchedulerConfiguration m_config;
+
+            const logger::Logger<> m_l;
     };
 
     struct ExecutorConfiguration {
@@ -180,6 +185,8 @@ namespace acairo {
 
             std::mutex m_coroutines_map_mutex;
             std::unordered_map<SocketEventKey, std::vector<Scheduler::WorkUnit>> m_coroutines_map;
+
+            const logger::Logger<> m_l;
     };
 
     class Future {
@@ -242,8 +249,6 @@ namespace acairo {
 
                 int fd = m_future_awaitable.get_fd();
                 EVENT_TYPE event_type = m_future_awaitable.get_event_type();
-
-                std::cout << "Scheduling coroutine handler on fd " << fd << " and event " << event_type << ".\n";
 
                 // https://lewissbaker.github.io/2017/11/17/understanding-operator-co-await
                 /* 
@@ -492,7 +497,8 @@ namespace acairo {
             TCPStream(const TCPStreamConfiguration& config, int fd, std::shared_ptr<Executor> executor) 
                 : m_fd(fd)
                 , m_config(config)
-                , m_executor(executor) {}
+                , m_executor(executor)
+                , m_l(logger::Logger<>().WithPair("Component", "TCPStream").WithPair("fd", fd)) {}
 
             acairo::Task<std::vector<char>> read(size_t number_of_bytes);
 
@@ -504,6 +510,8 @@ namespace acairo {
             const int m_fd;
             const TCPStreamConfiguration m_config;
             std::shared_ptr<Executor> m_executor;
+
+            const logger::Logger<> m_l;
     };
 
     struct TCPListenerConfiguration {
@@ -517,7 +525,8 @@ namespace acairo {
             TCPListener(const TCPListenerConfiguration& config, std::shared_ptr<Executor> executor) 
                 : m_stopped(false)
                 , m_config(config)
-                , m_executor(executor) {}
+                , m_executor(executor) 
+                , m_l(logger::Logger<>().WithPair("Component", "TCPListener")) {}
 
             void bind(const std::string& address);
 
@@ -542,6 +551,8 @@ namespace acairo {
             int m_listener_sockfd = 0;
             const TCPListenerConfiguration m_config;
             std::shared_ptr<Executor> m_executor;
+
+            const logger::Logger<> m_l;
     };
 }
 

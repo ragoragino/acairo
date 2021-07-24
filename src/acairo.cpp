@@ -46,7 +46,8 @@ namespace acairo {
         while (true) {
             int result = f(std::forward<Args>(args)...);
             if (result < 0 && errno == EINTR) {
-                std::cout << "Retrying syscall on EINTR.\n";
+                auto l = logger::Logger();
+                LOG(l, logger::debug) << "Retrying syscall on EINTR.";
                 continue;
             } else {
                 return result;
@@ -55,12 +56,14 @@ namespace acairo {
     }
 
     void log_socket_error(int fd) {
+        auto l = logger::Logger();
+
         int error = 0;
         socklen_t errlen = sizeof(error);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
-            std::cout << error_with_errno("Error occured on a socket: ");
+            LOG(l, logger::error) << error_with_errno("Error occured on a socket: ");
         } else {
-            std::cout << "Error occured on a socket, but unable to get socket error.\n";
+            LOG(l, logger::error) << "Error occured on a socket, but unable to get socket error.\n";
         }
     }
 
@@ -126,10 +129,10 @@ namespace acairo {
             try {
                 if (work_unit) {
                     work_unit->operator()();
-                    std::cout << "Successfully finished work unit: " << work_unit->get_id() << "\n";
+                    LOG(m_l, logger::debug) << "Successfully finished work unit: " << work_unit->get_id();
                 }
             } catch(const std::exception& e) {
-                std::cout << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << "\n";
+                LOG(m_l, logger::error) << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what();
             }
         }
     }
@@ -152,7 +155,8 @@ namespace acairo {
 
     Executor::Executor(const ExecutorConfiguration& config) 
     : m_scheduler(std::make_unique<Scheduler>(config.scheduler_config))
-    , m_config(config) {
+    , m_config(config)
+    , m_l(logger::Logger().WithPair("Component", "Executor")) {
         m_epoll_fd = epoll_create1(0);
         if (m_epoll_fd < 0) {
             throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
@@ -168,11 +172,15 @@ namespace acairo {
             event_type: event_type,
         };
 
+        LOG(m_l, logger::debug) << "Registering callback for fd [" << fd << "] and event [" << event_type << "].";
+
         std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
         
         // If there is a coroutine waiting for the fd, it must have been already registered with epoll.
         // Otherwise, register it.
         if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {  
+            LOG(m_l, logger::debug) << "Adding fd [" << fd << "] and event [" << event_type << "] to the epoll interest list.";
+
             // We need an edge-triggered notifications as we will be invoking handlers based on incoming events 
             struct epoll_event accept_event;
             accept_event.events = get_epoll_event_type(socket_event_key.event_type) | EPOLLET;
@@ -210,14 +218,16 @@ namespace acairo {
 
             std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
             for (int i = 0; i < count_of_ready_fds; i++) {
+                int fd = events[i].data.fd;
+
                 // In case of a socket error, let the handlers finish their work
                 if (events[i].events & EPOLLERR) {
-                    log_socket_error(events[i].data.fd);
+                    log_socket_error(fd);
 
-                    SocketEventKey event_key_in{events[i].data.fd, EVENT_TYPE::IN};
+                    SocketEventKey event_key_in{fd, EVENT_TYPE::IN};
                     schedule_ready_tasks(event_key_in);
 
-                    SocketEventKey event_key_out{events[i].data.fd, EVENT_TYPE::OUT};
+                    SocketEventKey event_key_out{fd, EVENT_TYPE::OUT};
                     schedule_ready_tasks(event_key_out);
 
                     continue;
@@ -227,18 +237,18 @@ namespace acairo {
                 // Therefore, it doesn't seem that we need to handle any special events connected
                 // with unexpected peer socket shutdown here.
                 if (events[i].events & EPOLLIN) {
-                    std::cout << "Adding handler for a fd " << events[i].data.fd << " and event_type " 
-                        << EVENT_TYPE::IN << " to the scheduler's queue.\n";
+                    LOG(m_l, logger::debug) << "Adding handler for a fd " << fd << " and event_type " 
+                        << EVENT_TYPE::IN << " to the scheduler's queue.";
 
-                    SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::IN};
+                    SocketEventKey event_key{fd, EVENT_TYPE::IN};
                     schedule_ready_tasks(event_key);
                 }
 
                 if (events[i].events & EPOLLOUT) {
-                    std::cout << "Adding handler for a fd " << events[i].data.fd << " and event_type " 
-                        << EVENT_TYPE::OUT << " to the scheduler's queue.\n";
+                    LOG(m_l, logger::debug) << "Adding handler for a fd " << fd << " and event_type " 
+                        << EVENT_TYPE::OUT << " to the scheduler's queue.";
 
-                    SocketEventKey event_key{events[i].data.fd, EVENT_TYPE::OUT};
+                    SocketEventKey event_key{fd, EVENT_TYPE::OUT};
                     schedule_ready_tasks(event_key);
                 }
             }
@@ -261,7 +271,7 @@ namespace acairo {
                 fd_was_registered = true;
 
                 if (m_coroutines_map[socket_event_key].size() != 0) {
-                    std::cout << "In event handlers active while deregistering fd from epoll.\n";
+                    LOG(m_l, logger::warn) << "In event handlers active while deregistering fd from epoll.";
                 }
 
                 m_coroutines_map.erase(socket_event_key);
@@ -272,7 +282,7 @@ namespace acairo {
                 fd_was_registered = true;
 
                 if (m_coroutines_map[socket_event_key].size() != 0) {
-                    std::cout << "Out event handlers active while deregistering fd from epoll.\n";
+                    LOG(m_l, logger::warn) << "Out event handlers active while deregistering fd from epoll.";
                 }
 
                 m_coroutines_map.erase(socket_event_key);
@@ -281,6 +291,8 @@ namespace acairo {
         
         // We remove the fd from the epoll interest list if it was added there before
         if (fd_was_registered) {
+            LOG(m_l, logger::debug) << "Removing fd " << fd << " from the epoll interest list.";
+
             // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
             // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
             if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_DEL, fd, (struct epoll_event *)nullptr) < 0) {
@@ -351,20 +363,20 @@ namespace acairo {
     }
 
     TCPStream::~TCPStream() {
-        std::cout << "Destructing fd: " << m_fd << "\n";
+        LOG(m_l, logger::debug) << "Destructing fd.";
 
         // Deregistering a fd can throw, so in case it throws we just log the error and continue
         // as there is not much we can do about it and we (probably?) want the program to continue
         try {
             m_executor->deregister_fd(m_fd);
         } catch(const std::exception& e){
-            std::cout << "Unable to deregister fd: " << e.what() << ".\n";
+            LOG(m_l, logger::error) << "Unable to deregister fd: " << e.what() << ".";
         }
 
         // close shouldn't block on non-blocking sockets
         int result = retry_sys_call(::close, m_fd);
         if (result < 0) {
-            std::cout << "Unable to close file descriptor: " << strerror(errno) << ".\n";
+            LOG(m_l, logger::error) << "Unable to close file descriptor: " << strerror(errno) << ".";
         }
     }
 
@@ -447,7 +459,7 @@ namespace acairo {
                 continue;
             }
 
-            std::cout << "Number of accepted connections pushed to the buffer: " << processed_conns_count << "\n";
+            LOG(m_l, logger::debug) << "Number of accepted connections pushed to the buffer: " << processed_conns_count << ".";
 
             m_accepted_conns_cv.notify_all();
         }
@@ -473,13 +485,13 @@ namespace acairo {
             int newsockfd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
             if (newsockfd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    std::cout << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.\n";
+                    LOG(m_l, logger::debug) << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.";
                 } else {
                     throw std::runtime_error("Accepting new connection failed");
                 }
             }
 
-            std::cout << "Accepted new connection: " << newsockfd << "\n";
+            LOG(m_l, logger::debug) << "Accepted new connection: " << newsockfd << ".";
 
             m_accepted_conns.push(newsockfd);
         }
@@ -508,8 +520,6 @@ namespace acairo {
 
         int accepted_conn_fd = m_accepted_conns.front();
         m_accepted_conns.pop();
-
-        std::cout << "Creating TCPStream from fd: " << accepted_conn_fd << "\n";
         
         make_socket_non_blocking(accepted_conn_fd);
         

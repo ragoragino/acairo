@@ -29,10 +29,12 @@ namespace cairo {
     // Retry syscalls on EINTR
     template<typename F, typename... Args>
     int retry_sys_call(F&& f, Args&&... args) {
+        auto l = logger::Logger();
+
         while (true) {
             int result = f(std::forward<Args>(args)...);
             if (result < 0 && errno == EINTR) {
-                std::cout << "Retrying syscall on EINTR.\n";
+                LOG(l, logger::debug) << "Retrying syscall on EINTR.\n";
                 continue;
             } else {
                 return result;
@@ -88,7 +90,7 @@ namespace cairo {
             if (number_of_bytes_written < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // TODO: Remove when async
-                    std::this_thread::sleep_for(100ms);
+                    std::this_thread::sleep_for(10ms);
                     continue;
                 }
 
@@ -113,7 +115,7 @@ namespace cairo {
             if (number_of_bytes_written < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // TODO: Remove when async
-                    std::this_thread::sleep_for(100ms);
+                    std::this_thread::sleep_for(10ms);
                     continue;
                 }
 
@@ -131,7 +133,7 @@ namespace cairo {
         // Close shouldn't block on non-blocking sockets
         int result = retry_sys_call(::close, m_fd);
         if (result < 0) {
-            std::cout << "Unable to close file descriptor: " << strerror(errno) << ".\n";
+            LOG(m_l, logger::error) << "Unable to close file descriptor: " << strerror(errno) << ".";
         }
     }
 
@@ -214,7 +216,7 @@ namespace cairo {
                 continue;
             }
 
-            std::cout << "Number of accepted connections pushed to the buffer: " << processed_conns_count << "\n";
+            LOG(m_l, logger::debug) << "Number of accepted connections pushed to the buffer: " << processed_conns_count << ".";
 
             m_accepted_conns_cv.notify_all();
         }
@@ -227,8 +229,8 @@ namespace cairo {
 
         for (int i = 0; i < waiting_conns_count; i++) {
             if (events[i].events & EPOLLERR) {
-                // TODO: Check properly this event
-                throw std::runtime_error("epoll_wait returned EPOLLERR");
+                LOG(m_l, logger::warn) << "Received EPOLLERR while accepting new connection.";
+                continue;
             }
 
             if (m_accepted_conns.size() == m_config.max_number_of_fds) {
@@ -240,13 +242,13 @@ namespace cairo {
             int newsockfd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
             if (newsockfd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    std::cout << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.\n";
+                    LOG(m_l, logger::debug) << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.";
                 } else {
                     throw std::runtime_error("Accepting new connection failed");
                 }
             }
 
-            std::cout << "Accepted new connection: " << newsockfd << "\n";
+            LOG(m_l, logger::debug) << "Accepted new connection: " << newsockfd << ".";
 
             m_accepted_conns.push(newsockfd);
         }
@@ -275,11 +277,7 @@ namespace cairo {
 
         int accepted_conn_fd = m_accepted_conns.front();
         m_accepted_conns.pop();
-
-        std::cout << "Creating TCPStream from fd: " << accepted_conn_fd << "\n";
         
-        // TODO: Add later
-        // set_non_blocking_on_socket(newsockfd);
         return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd);   
     }
 
@@ -320,10 +318,10 @@ namespace cairo {
             try {
                 if (work_unit) {
                     work_unit->operator()();
-                    std::cout << "Successfully finished work unit: " << work_unit->get_id() << "\n";
+                    LOG(m_l, logger::debug) << "Successfully finished work unit: " << work_unit->get_id() << ".";
                 }
             } catch(const std::exception& e) {
-                std::cout << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << "\n";
+                LOG(m_l, logger::error) << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what() << ".";
                 work_unit->set_exception(std::current_exception());
             }
         }
