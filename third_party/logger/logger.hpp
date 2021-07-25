@@ -30,8 +30,9 @@ namespace logger {
     void InitializeGlobalLogger(const Configuration& config);
 
     namespace detail {
+        // Used internally to fetch the global mutex protecting standard time functions.
         std::mutex& GetGlobalTimeMutex();
-    }
+    } // namespace detail
     
     // TODO: Use C++ 20 syncstream here instead of custom lock, when it will be properly supported.
     class LogStream {
@@ -68,7 +69,7 @@ namespace logger {
             template<typename T>
             std::string FormatPair(std::string&& key, T&& value) const {
                 std::stringstream ss;
-                ss << "(" << key << ": " << value << ")";  
+                ss << "(" << std::move(key) << ": " << std::forward<T>(value) << ")";  
 
                 return ss.str();
             }
@@ -130,7 +131,7 @@ namespace logger {
             
             template<typename T>
             Logger WithPair(std::string&& key, T&& value) {
-                std::string formatted_pair = m_formatter->FormatPair(std::move(key), std::move(value));
+                std::string formatted_pair = m_formatter->FormatPair(std::move(key), std::forward<T>(value));
 
                 std::string delimiter = "";
                 if (!m_metadata.empty()) {

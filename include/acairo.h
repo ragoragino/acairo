@@ -17,9 +17,16 @@
 
 #include "logger.hpp"
 
-// SocketEventKey's hash template specialization must be defined before 
-// its first usage.
 namespace acairo {
+    // We define logger at the namespace level, so it doesn't need to be defined
+    // in each separate class and we can easily change it (e.g. template) 
+    // when needed
+    namespace detail {
+        struct Types {
+            using Logger = logger::Logger<>;
+        };
+    }
+
     enum class EVENT_TYPE : uint8_t {
         IN,
         OUT,
@@ -35,6 +42,8 @@ namespace acairo {
     };
 }
 
+// SocketEventKey's hash template specialization must be defined before 
+// its first usage.
 namespace std {
     template <> 
     struct hash<acairo::SocketEventKey>
@@ -126,7 +135,7 @@ namespace acairo {
 
             const SchedulerConfiguration m_config;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 
     struct ExecutorConfiguration {
@@ -186,7 +195,7 @@ namespace acairo {
             std::mutex m_coroutines_map_mutex;
             std::unordered_map<SocketEventKey, std::vector<Scheduler::WorkUnit>> m_coroutines_map;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 
     class Future {
@@ -511,7 +520,7 @@ namespace acairo {
             const TCPStreamConfiguration m_config;
             std::shared_ptr<Executor> m_executor;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 
     struct TCPListenerConfiguration {
@@ -552,7 +561,7 @@ namespace acairo {
             const TCPListenerConfiguration m_config;
             std::shared_ptr<Executor> m_executor;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 }
 

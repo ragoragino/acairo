@@ -16,6 +16,15 @@
 #include "logger.hpp"
 
 namespace cairo {
+    // We define logger at the namespace level, so it doesn't need to be defined
+    // in each separate class and we can easily change it (e.g. template) 
+    // when needed
+    namespace detail {
+        struct Types {
+            using Logger = logger::Logger<>;
+        };
+    }
+
     struct TCPListenerStoppedError : public std::exception {
         const char * what () const noexcept {
             return "TCPListener was stopped.";
@@ -47,7 +56,7 @@ namespace cairo {
             const int m_fd;
             const TCPStreamConfiguration m_config;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 
     struct TCPListenerConfiguration {
@@ -86,7 +95,7 @@ namespace cairo {
             int m_listener_sockfd = 0;
             const TCPListenerConfiguration m_config;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 
     struct ExecutorConfiguration {
@@ -159,6 +168,6 @@ namespace cairo {
 
             const ExecutorConfiguration m_config;
 
-            const logger::Logger<> m_l;
+            const detail::Types::Logger m_l;
     };
 }
