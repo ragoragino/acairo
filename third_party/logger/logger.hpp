@@ -24,20 +24,16 @@ namespace logger {
         SeverityLevel log_level;
     };
 
-    // Mutex protecting stdout
-    static std::mutex stdout_mutex;
-
-    // In C++ there is no thread-safe and portable way to output current date and time..., 
-    // so we have to use a mutex over provided standard functions
-    // std::format (C++ 20) should resolve this unfortunate situation.
-    static std::mutex time_mutex;
-
     Configuration GetGlobalConfiguration();
 
     // Must be called only once and before any Logger constructors.
     void InitializeGlobalLogger(const Configuration& config);
+
+    namespace detail {
+        std::mutex& GetGlobalTimeMutex();
+    }
     
-    // TODO: Use C++ 20 syncstream here instead of custom lock, when it will be properly supported
+    // TODO: Use C++ 20 syncstream here instead of custom lock, when it will be properly supported.
     class LogStream {
         public:
             LogStream(bool noop, std::string&& metadata) 
@@ -83,7 +79,7 @@ namespace logger {
                 auto now = std::chrono::system_clock::now();
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-                std::lock_guard<std::mutex> lock(time_mutex);
+                std::lock_guard<std::mutex> lock(detail::GetGlobalTimeMutex());
                 auto time = std::time(nullptr);
                 ss << "(" << key << ": " << std::put_time(std::gmtime(&time), "%Y-%m-%d %T") << "." 
                     << std::setfill('0') << std::setw(3) << ms.count() << ')';

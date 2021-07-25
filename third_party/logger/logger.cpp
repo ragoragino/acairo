@@ -16,6 +16,20 @@ namespace logger {
     // Global log config. Not protected by lock!
     Configuration m_global_config;
 
+    // Mutex protecting stdout
+    std::mutex stdout_mutex;
+
+    // In C++ there is no thread-safe and portable way to output current date and time..., 
+    // so we have to use a mutex over provided standard functions
+    // std::format (C++ 20) should resolve this unfortunate situation.
+    std::mutex time_mutex;
+
+    namespace detail {
+        std::mutex& GetGlobalTimeMutex(){
+            return stdout_mutex;
+        }
+    }
+    
     SeverityLevel SeverityLevelFromString(const std::string& level) {
         if (level == "trace") {
             return trace;
