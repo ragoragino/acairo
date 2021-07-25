@@ -22,19 +22,18 @@ namespace cairo {
     // Create an error message containing stringified errno
     std::string error_with_errno(const std::string& message){
         std::stringstream ss{};
-        ss << message << ": " << strerror(errno) << ".\n";
+        ss << message << ": " << strerror(errno) << ".";
         return ss.str();
     }
 
     // Retry syscalls on EINTR
     template<typename F, typename... Args>
     int retry_sys_call(F&& f, Args&&... args) {
-        auto l = logger::Logger();
-
         while (true) {
             int result = f(std::forward<Args>(args)...);
             if (result < 0 && errno == EINTR) {
-                LOG(l, logger::debug) << "Retrying syscall on EINTR.\n";
+                auto l = logger::Logger();
+                LOG(l, logger::debug) << "Retrying syscall on EINTR.";
                 continue;
             } else {
                 return result;

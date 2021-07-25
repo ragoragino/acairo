@@ -11,7 +11,7 @@ volatile sig_atomic_t sig_flag = 0;
 volatile sig_atomic_t force_shutdown = 0;
 
 acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
-    auto l = logger::Logger<>();
+    auto l = logger::Logger();
 
     try {
         std::vector<char> vector_received_message = co_await stream->read(27);
@@ -37,8 +37,8 @@ int main(){
 
     // Initialize logger
     auto log_config = logger::Configuration("debug");
-    logger::InitializeLogger(log_config);
-    auto l = logger::Logger<>().WithPair("Component", "main");
+    logger::InitializeGlobalLogger(log_config);
+    auto l = logger::Logger().WithPair("Component", "main");
 
     SchedulerConfiguration scheduler_config{
         number_of_worker_threads: 10,

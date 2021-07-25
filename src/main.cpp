@@ -18,15 +18,15 @@ void handle_socket(std::shared_ptr<cairo::TCPStream> stream) {
 
         std::string received_message(vector_received_message.begin(), vector_received_message.end());
         
-        LOG(l, logger::debug) << "Reading from socket was succesful:" << received_message << "\n"; 
+        LOG(l, logger::debug) << "Reading from socket was succesful:" << received_message; 
 
         const std::string send_message = "Just nod if you can hear me!";
         std::vector<char> vector_message(send_message.begin(), send_message.end());
         stream->write(std::move(vector_message));
 
-        LOG(l, logger::debug) << "Writing to socket was successful." << "\n"; 
+        LOG(l, logger::debug) << "Writing to socket was successful."; 
     } catch (const std::exception& e){
-        LOG(l, logger::error) << "handle_socket failed: " << e.what() << "\n"; 
+        LOG(l, logger::error) << "handle_socket failed: " << e.what(); 
     }
 }
 
@@ -37,7 +37,7 @@ int main(){
 
     // Initialize logger
     auto log_config = logger::Configuration("error");
-    logger::InitializeLogger(log_config);
+    logger::InitializeGlobalLogger(log_config);
     auto l = logger::Logger().WithPair("Component", "main");
 
     ExecutorConfiguration executor_config{
@@ -62,7 +62,7 @@ int main(){
     if (std::signal(SIGINT, [](int) -> void {
         sig_flag = 1;
     }) == SIG_ERR) {
-        std::cout << "Unable to register signal handler.\n";
+        std::cout << "Unable to register signal handler.";
         exit(1);
     }
 

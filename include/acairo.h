@@ -100,7 +100,7 @@ namespace acairo {
                 : m_threadPool(config.number_of_worker_threads)
                 , m_stopped(false)
                 , m_config(config)
-                , m_l(logger::Logger<>().WithPair("Component", "Scheduler")) {
+                , m_l(logger::Logger().WithPair("Component", "Scheduler")) {
                     for(std::uint8_t i = 0; i != m_config.number_of_worker_threads; i++) {
                         m_threadPool[i] = std::thread(&Scheduler::start_worker, this);
                     }
@@ -498,7 +498,7 @@ namespace acairo {
                 : m_fd(fd)
                 , m_config(config)
                 , m_executor(executor)
-                , m_l(logger::Logger<>().WithPair("Component", "TCPStream").WithPair("fd", fd)) {}
+                , m_l(logger::Logger().WithPair("Component", "TCPStream").WithPair("fd", fd)) {}
 
             acairo::Task<std::vector<char>> read(size_t number_of_bytes);
 
@@ -526,7 +526,7 @@ namespace acairo {
                 : m_stopped(false)
                 , m_config(config)
                 , m_executor(executor) 
-                , m_l(logger::Logger<>().WithPair("Component", "TCPListener")) {}
+                , m_l(logger::Logger().WithPair("Component", "TCPListener")) {}
 
             void bind(const std::string& address);
 

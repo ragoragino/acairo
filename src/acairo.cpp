@@ -21,7 +21,7 @@
 namespace acairo {
     std::string error_with_errno(const std::string& message){
         std::stringstream ss{};
-        ss << message << ": " << strerror(errno) << ".\n";
+        ss << message << ": " << strerror(errno) << ".";
         return ss.str();
     }
 
@@ -63,7 +63,7 @@ namespace acairo {
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
             LOG(l, logger::error) << error_with_errno("Error occured on a socket: ");
         } else {
-            LOG(l, logger::error) << "Error occured on a socket, but unable to get socket error.\n";
+            LOG(l, logger::error) << "Error occured on a socket, but unable to get socket error.";
         }
     }
 
@@ -309,7 +309,7 @@ namespace acairo {
                 return EPOLLOUT;
             default:
                 std::stringstream ss;
-                ss << "Unrecognized waiting event type: " << event_type << "\n";
+                ss << "Unrecognized waiting event type: " << event_type << ".";
                 throw std::runtime_error(ss.str());
         }
     }

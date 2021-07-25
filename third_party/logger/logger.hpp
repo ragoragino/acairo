@@ -6,13 +6,18 @@
 #include <mutex>
 #include <memory>
 #include <iostream>
+#include <iomanip>
+#include <iostream>
+#include <chrono>
 
 namespace logger {
 
     enum SeverityLevel { trace, debug, info, warn, error, critical };
 
+    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level);
+
     struct Configuration {
-        Configuration() : log_level(debug) {}
+        Configuration() : log_level(info) {}
 
         Configuration(std::string level);
 
@@ -22,12 +27,17 @@ namespace logger {
     // Mutex protecting stdout
     static std::mutex stdout_mutex;
 
-    // Global log config
-    // Not protected by lock!
-    // TODO: why doesn't this work? 
-    static Configuration m_global_config;
+    // In C++ there is no thread-safe and portable way to output current date and time..., 
+    // so we have to use a mutex over provided standard functions
+    // std::format (C++ 20) should resolve this unfortunate situation.
+    static std::mutex time_mutex;
 
-    // TODO: Use syncstream here
+    Configuration GetGlobalConfiguration();
+
+    // Must be called only once and before any Logger constructors.
+    void InitializeGlobalLogger(const Configuration& config);
+    
+    // TODO: Use C++ 20 syncstream here instead of custom lock, when it will be properly supported
     class LogStream {
         public:
             LogStream(bool noop, std::string&& metadata) 
@@ -66,17 +76,28 @@ namespace logger {
 
                 return ss.str();
             }
+
+            std::string FormatTime(std::string&& key) {
+                std::stringstream ss;
+
+                auto now = std::chrono::system_clock::now();
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+                std::lock_guard<std::mutex> lock(time_mutex);
+                auto time = std::time(nullptr);
+                ss << "(" << key << ": " << std::put_time(std::gmtime(&time), "%Y-%m-%d %T") << "." 
+                    << std::setfill('0') << std::setw(3) << ms.count() << ')';
+
+                return ss.str();
+            }
     };
 
     template<typename Formatter = BasicFormatter>
     struct Logger {
         public:
             Logger()
-                : m_config(m_global_config)
+                : m_config(GetGlobalConfiguration())
                 , m_formatter(std::make_shared<BasicFormatter>()) {
-                    // auto config_ptr = &m_global_config;
-
-                    std::cout << this << "\n";
                 }
 
             explicit Logger(const Configuration& config) 
@@ -102,7 +123,11 @@ namespace logger {
                     return LogStream(true, "");
                 }
 
-                std::string metadata = m_metadata + " " + m_formatter->FormatPair("Severity", severity);
+                std::string metadata = m_formatter->FormatPair("Severity", severity) +
+                    " " +
+                    m_formatter->FormatTime("Time") +
+                    " " + 
+                    m_metadata;
 
                 return LogStream(false, std::move(metadata));
             }
@@ -111,7 +136,12 @@ namespace logger {
             Logger WithPair(std::string&& key, T&& value) {
                 std::string formatted_pair = m_formatter->FormatPair(std::move(key), std::move(value));
 
-                std::string metadata = m_metadata + " " + formatted_pair;
+                std::string delimiter = "";
+                if (!m_metadata.empty()) {
+                    delimiter = " ";
+                }
+
+                std::string metadata = m_metadata + delimiter + formatted_pair;
 
                 return Logger(m_config, m_formatter, std::move(metadata));
             }
@@ -122,9 +152,6 @@ namespace logger {
 
             std::string m_metadata;
     };
-
-    // Must be called only once and before any Logger constructors.
-    void InitializeLogger(const Configuration& config);
 
 #define LOG(logger, severity) logger.Log(severity)
 }  // namespace logger

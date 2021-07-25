@@ -13,6 +13,9 @@ Therefore, we need to roll our own mini-library here.
 
 namespace logger {
 
+    // Global log config. Not protected by lock!
+    Configuration m_global_config;
+
     SeverityLevel SeverityLevelFromString(const std::string& level) {
         if (level == "trace") {
             return trace;
@@ -35,7 +38,7 @@ namespace logger {
         log_level = SeverityLevelFromString(level); 
     };
 
-    std::ostream& operator<<(std::ostream& stream, SeverityLevel level) {
+    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level) {
         static const char* strings[] = {"trace", "debug", "info", "warn", "error", "critical"};
 
         if (static_cast<size_t>(level) < sizeof(strings) / sizeof(*strings)) {
@@ -47,8 +50,12 @@ namespace logger {
         return stream;
     }
 
-    void InitializeLogger(const Configuration& configuration) {
+    void InitializeGlobalLogger(const Configuration& configuration) {
         m_global_config = configuration;
+    }
+
+    Configuration GetGlobalConfiguration() {
+        return m_global_config;
     }
 
     LogStream::~LogStream() {
