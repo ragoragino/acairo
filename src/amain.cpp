@@ -16,7 +16,7 @@ acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     try {
         std::vector<char> vector_received_message = co_await stream->read(27);
 
-        std::string received_message(vector_received_message.begin(), vector_received_message.end());
+        const std::string received_message(vector_received_message.begin(), vector_received_message.end());
         
         LOG(l, logger::debug) << "Reading from socket was succesful:" << received_message; 
 
