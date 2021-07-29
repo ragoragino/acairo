@@ -14,6 +14,7 @@
 #include <memory>
 #include <unordered_map>
 #include <coroutine>
+#include <sys/epoll.h>
 
 #include "logger.hpp"
 
@@ -179,6 +180,8 @@ namespace acairo {
                 m_scheduler->stop();
             }
 
+            ~Executor();
+
         private:
             void run_epoll_listener();
 
@@ -249,6 +252,17 @@ namespace acairo {
                 return false; 
             }
 
+            /*
+            https://en.cppreference.com/w/cpp/language/coroutines
+
+            Note that because the coroutine is fully suspended before entering awaiter.await_suspend(), 
+            that function is free to transfer the coroutine handle across threads, with no additional
+            synchronization. For example, it can put it inside a callback, scheduled to run on a threadpool 
+            when async I/O operation completes. In that case, since the current coroutine may have been 
+            resumed and thus executed the awaiter object's destructor, all concurrently as await_suspend() 
+            continues its execution on the current thread, await_suspend() should treat *this as destroyed 
+            and not access it after the handle was published to other threads. 
+            */
             void await_suspend(std::coroutine_handle<> handle) const noexcept {
                 auto continuation_handle = [handle]() mutable {
                     handle.resume();
@@ -259,13 +273,6 @@ namespace acairo {
                 int fd = m_future_awaitable.get_fd();
                 EVENT_TYPE event_type = m_future_awaitable.get_event_type();
 
-                // https://lewissbaker.github.io/2017/11/17/understanding-operator-co-await
-                /* 
-                So within the await_suspend() method, once it’s possible for the coroutine to be resumed concurrently 
-                on another thread, you need to make sure that you avoid accessing this or the coroutine’s .promise() 
-                object because both could already be destroyed. In general, the only things that are safe to access 
-                after the operation is started and the coroutine is scheduled for resumption are local variables within await_suspend().
-                */
                 executor->register_event_handler(fd, event_type, std::move(continuation_handle));
             }
 
@@ -543,21 +550,16 @@ namespace acairo {
 
             void shutdown();
 
+            ~TCPListener();
+
         private:
-            void run_epoll_listener();
-
-            int process_waiting_connections(struct epoll_event* events, int waiting_conns_count);
-
-            std::queue<int> m_accepted_conns;
-            std::mutex m_accepted_conns_mutex;
-            std::condition_variable m_accepted_conns_cv;
-
-            std::thread m_epoll_thread;
-            std::mutex m_epoll_thread_mutex;
-
             std::atomic_bool m_stopped;
-            
-            int m_listener_sockfd = 0;
+
+            struct epoll_event m_accept_event;
+
+            int m_listener_sockfd = -1;
+            int m_epoll_fd = -1;
+
             const TCPListenerConfiguration m_config;
             std::shared_ptr<Executor> m_executor;
 

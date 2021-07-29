@@ -1,6 +1,5 @@
 #include <cstring>
 #include <cstdlib>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -56,12 +55,12 @@ namespace acairo {
     }
 
     void log_socket_error(int fd) {
-        auto l = logger::Logger();
+        auto l = logger::Logger().WithPair("fd", fd);
 
         int error = 0;
         socklen_t errlen = sizeof(error);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
-            LOG(l, logger::error) << error_with_errno("Error occured on a socket: ");
+            LOG(l, logger::error) << error_with_errno("Error occured on a socket");
         } else {
             LOG(l, logger::error) << "Error occured on a socket, but unable to get socket error.";
         }
@@ -194,11 +193,7 @@ namespace acairo {
     }
 
     void Executor::run_epoll_listener() {
-        struct epoll_event* events = (struct epoll_event*)calloc(m_config.max_number_of_fds, 
-            sizeof(struct epoll_event));
-        if (events == NULL) {
-            throw std::runtime_error("Unable to allocate memory for epoll_events");
-        }
+        auto events = std::make_unique<struct epoll_event[]>(m_config.max_number_of_fds);
 
         auto schedule_ready_tasks = [this](const SocketEventKey& event_key){
             auto& tasks = m_coroutines_map[event_key];
@@ -211,17 +206,18 @@ namespace acairo {
 
         while (!m_stopped) {
             // TODO: Make epoll_wait waiting time configurable
-            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events, m_config.max_number_of_fds, 10);
+            const int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events.get(), m_config.max_number_of_fds, 10);
             if (count_of_ready_fds < 0) {
                 throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
             }
 
             std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
             for (int i = 0; i < count_of_ready_fds; i++) {
-                int fd = events[i].data.fd;
+                const struct epoll_event& event = events.get()[i];
+                const int fd = event.data.fd;
 
                 // In case of a socket error, let the handlers finish their work
-                if (events[i].events & EPOLLERR) {
+                if (event.events & EPOLLERR) {
                     log_socket_error(fd);
 
                     SocketEventKey event_key_in{fd, EVENT_TYPE::IN};
@@ -236,7 +232,7 @@ namespace acairo {
                 // EPOLLIN and EPOLLOUT should be also called when the peer closed that end of the socket.
                 // Therefore, it doesn't seem that we need to handle any special events connected
                 // with unexpected peer socket shutdown here.
-                if (events[i].events & EPOLLIN) {
+                if (event.events & EPOLLIN) {
                     LOG(m_l, logger::debug) << "Adding handler for a fd " << fd << " and event_type " 
                         << EVENT_TYPE::IN << " to the scheduler's queue.";
 
@@ -244,7 +240,7 @@ namespace acairo {
                     schedule_ready_tasks(event_key);
                 }
 
-                if (events[i].events & EPOLLOUT) {
+                if (event.events & EPOLLOUT) {
                     LOG(m_l, logger::debug) << "Adding handler for a fd " << fd << " and event_type " 
                         << EVENT_TYPE::OUT << " to the scheduler's queue.";
 
@@ -260,33 +256,32 @@ namespace acairo {
 
         // Firstly remove all the registered handlers associated with the fd
         {
+            auto erase_key_func = [&fd_was_registered, this](const SocketEventKey& socket_event_key){
+                if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
+                    fd_was_registered = true;
+
+                    if (m_coroutines_map[socket_event_key].size() != 0) {
+                        LOG(m_l, logger::warn) << socket_event_key.event_type << " event handlers for fd" << 
+                            socket_event_key.fd << " active while deregistering fd from epoll.";
+                    }
+
+                    m_coroutines_map.erase(socket_event_key);
+                };
+            };
+
             std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
 
-            auto socket_event_key = SocketEventKey{
+            auto socket_event_key_in = SocketEventKey{
                 fd: fd,
                 event_type: EVENT_TYPE::IN,
             };
+            erase_key_func(socket_event_key_in);
 
-            if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
-                fd_was_registered = true;
-
-                if (m_coroutines_map[socket_event_key].size() != 0) {
-                    LOG(m_l, logger::warn) << "In event handlers active while deregistering fd from epoll.";
-                }
-
-                m_coroutines_map.erase(socket_event_key);
-            }
-
-            socket_event_key.event_type = EVENT_TYPE::OUT;
-            if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
-                fd_was_registered = true;
-
-                if (m_coroutines_map[socket_event_key].size() != 0) {
-                    LOG(m_l, logger::warn) << "Out event handlers active while deregistering fd from epoll.";
-                }
-
-                m_coroutines_map.erase(socket_event_key);
+            auto socket_event_key_out = SocketEventKey{
+                fd: fd,
+                event_type: EVENT_TYPE::OUT,
             };
+            erase_key_func(socket_event_key_out);
         }
         
         // We remove the fd from the epoll interest list if it was added there before
@@ -311,6 +306,16 @@ namespace acairo {
                 std::stringstream ss;
                 ss << "Unrecognized waiting event type: " << event_type << ".";
                 throw std::runtime_error(ss.str());
+        }
+    }
+
+    Executor::~Executor() {
+        stop();
+
+        if (m_epoll_fd >= 0) {
+            if (retry_sys_call(::close, m_epoll_fd) < 0) {
+                LOG(m_l, logger::error) << error_with_errno("Unable to close listening epoll fd");
+            }
         }
     }
 
@@ -362,6 +367,8 @@ namespace acairo {
         }
     }
 
+    // Firstly, deregister fd from epoll and then close it
+    // https://idea.popcount.org/2017-03-20-epoll-is-fundamentally-broken-22/
     TCPStream::~TCPStream() {
         LOG(m_l, logger::debug) << "Destructing fd.";
 
@@ -374,9 +381,8 @@ namespace acairo {
         }
 
         // close shouldn't block on non-blocking sockets
-        int result = retry_sys_call(::close, m_fd);
-        if (result < 0) {
-            LOG(m_l, logger::error) << "Unable to close file descriptor: " << strerror(errno) << ".";
+        if (retry_sys_call(::close, m_fd) < 0) {
+            LOG(m_l, logger::error) << error_with_errno("Unable to close file descriptor");
         }
     }
 
@@ -410,116 +416,65 @@ namespace acairo {
 
         make_socket_non_blocking(sockfd);
 
-        m_listener_sockfd = sockfd;
-    }
-
-    void TCPListener::run_epoll_listener() {
-        using namespace std::chrono_literals;
-
-        auto epoll_fd = epoll_create1(0);
-        if (epoll_fd < 0) {
+        m_epoll_fd = epoll_create1(0);
+        if (m_epoll_fd < 0) {
             throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
         }
 
-        struct epoll_event accept_event;
-        accept_event.events = EPOLLIN;
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, m_listener_sockfd, &accept_event) < 0) {
+        m_accept_event.events = EPOLLIN;
+        if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_ADD, sockfd, &m_accept_event) < 0) {
             throw std::runtime_error(error_with_errno("Unable to add listener socket to the epoll interest list"));
         }
 
-        struct epoll_event* events = (struct epoll_event*)calloc(m_config.max_number_of_fds, 
-            sizeof(struct epoll_event));
-        if (events == NULL) {
-            throw std::runtime_error("Unable to allocate memory for epoll_events");
-        }
-
-        while (!m_stopped) {    
-            // In case consumer threads arer slow, wait for them until they
-            // process at least some of the accepted connections
-            bool consumers_throttled = false;
-            {
-                std::lock_guard<std::mutex> lock(m_accepted_conns_mutex); 
-                assertm(m_config.max_number_of_fds >= m_accepted_conns.size(), "Limit of accepted connections was exceeded.");
-                consumers_throttled = m_config.max_number_of_fds == m_accepted_conns.size();
-            }
-            
-            if (consumers_throttled) {
-                // TODO: Make this configurable
-                std::this_thread::sleep_for(50ms); 
-                continue;
-            }
-
-            int count_of_ready_fds = retry_sys_call(epoll_wait, epoll_fd, events, m_config.max_number_of_fds, 100);
-            if (count_of_ready_fds < 0) {
-                throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
-            }
-
-            int processed_conns_count = process_waiting_connections(events, count_of_ready_fds);
-            if (processed_conns_count == 0) {
-                continue;
-            }
-
-            LOG(m_l, logger::debug) << "Number of accepted connections pushed to the buffer: " << processed_conns_count << ".";
-
-            m_accepted_conns_cv.notify_all();
-        }
+        m_listener_sockfd = sockfd;
     }
 
-    int TCPListener::process_waiting_connections(struct epoll_event* events, int waiting_conns_count) {
-        std::lock_guard<std::mutex> lock(m_accepted_conns_mutex);
-
-        size_t original_conns_count = m_accepted_conns.size();
-
-        for (int i = 0; i < waiting_conns_count; i++) {
-            if (events[i].events & EPOLLERR) {
-                log_socket_error(events[i].data.fd);
-                continue;
-            }
-
-            if (m_accepted_conns.size() == m_config.max_number_of_fds) {
-                return m_accepted_conns.size() - original_conns_count;
-            }
-            
-            struct sockaddr_in peer_addr;
-            socklen_t peer_addr_len = sizeof(peer_addr);
-            int newsockfd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
-            if (newsockfd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    LOG(m_l, logger::debug) << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.";
-                } else {
-                    throw std::runtime_error("Accepting new connection failed");
-                }
-            }
-
-            LOG(m_l, logger::debug) << "Accepted new connection: " << newsockfd << ".";
-
-            m_accepted_conns.push(newsockfd);
-        }
-
-        return m_accepted_conns.size() - original_conns_count;
-    }
-
+    // Using just single epoll listener, as it should suffice our purposes.
+    // A great article explaining all the problems with multi-threaded epoll: 
+    // https://idea.popcount.org/2017-02-20-epoll-is-fundamentally-broken-12/
     std::shared_ptr<TCPStream> TCPListener::accept() {
         if (m_listener_sockfd <= 0) {
             throw std::runtime_error("Listening socket was not initialized.");
         }
 
-        // Lazily initialize thread waiting for epoll events
-        if (auto lock = std::lock_guard<std::mutex>(m_epoll_thread_mutex); !m_epoll_thread.joinable()) {
-            m_epoll_thread = std::thread(&TCPListener::run_epoll_listener, this);
-        }
-        
-        // Take new connection from the queue of accepted connections
-        std::unique_lock<std::mutex> lock(m_accepted_conns_mutex);
-        if (m_accepted_conns.size() == 0) {
-            m_accepted_conns_cv.wait(lock, [this]{ return m_accepted_conns.size() > 0 || m_stopped; });
-            if (m_stopped) {
-                throw TCPListenerStoppedError();
+        int accepted_conn_fd = -1;
+        while (!m_stopped && accepted_conn_fd < 0) {
+            auto event = std::make_unique<struct epoll_event>();
+
+            // We just wait for max 10ms on epoll until it returns
+            // If there are no new events, we continue looping.
+            // Otherwise, we accept new socket.
+            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, &(*event), 1, 10);
+            if (count_of_ready_fds < 0) {
+                throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
+            } else if (count_of_ready_fds == 0) {
+                continue;
             }
+
+            if (event->events & EPOLLERR) {
+                log_socket_error(event->data.fd);
+                continue;
+            }
+
+            struct sockaddr_in peer_addr;
+            socklen_t peer_addr_len = sizeof(peer_addr);
+            accepted_conn_fd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
+            if (accepted_conn_fd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    LOG(m_l, logger::warn) << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.";
+                    continue;
+                } else {
+                    LOG(m_l, logger::error) << error_with_errno("Failure when accepting a new connection");
+                    continue;
+                }
+            }
+
+            LOG(m_l, logger::debug) << "Accepted new connection: " << accepted_conn_fd << ".";
         }
 
-        int accepted_conn_fd = m_accepted_conns.front();
-        m_accepted_conns.pop();
+        if (m_stopped) {
+            throw TCPListenerStoppedError();
+        }
         
         make_socket_non_blocking(accepted_conn_fd);
         
@@ -528,11 +483,22 @@ namespace acairo {
 
     void TCPListener::shutdown() {
         m_stopped = true;
-        m_accepted_conns_cv.notify_all();
+    }
 
-        std::lock_guard<std::mutex> lock(m_epoll_thread_mutex); 
-        if (m_epoll_thread.joinable()) {
-            m_epoll_thread.join();
+    TCPListener::~TCPListener(){
+        shutdown();
+
+         if (m_epoll_fd >= 0) {
+            if (retry_sys_call(::close, m_epoll_fd) < 0) {
+                LOG(m_l, logger::error) << error_with_errno("Unable to close listening epoll fd");
+            }
         }
+
+        if (m_listener_sockfd >= 0) {
+            if (retry_sys_call(::close, m_listener_sockfd) < 0) {
+                auto l = m_l.WithPair("fd", m_listener_sockfd);
+                LOG(l, logger::error) << error_with_errno("Unable to close listener fd");
+            }
+        }   
     }
 }

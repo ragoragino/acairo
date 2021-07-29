@@ -130,7 +130,7 @@ namespace logger {
             }
             
             template<typename T>
-            Logger WithPair(std::string&& key, T&& value) {
+            Logger WithPair(std::string&& key, T&& value) const {
                 std::string formatted_pair = m_formatter->FormatPair(std::move(key), std::forward<T>(value));
 
                 std::string delimiter = "";
