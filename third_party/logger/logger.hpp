@@ -14,17 +14,17 @@ namespace logger {
 
     enum SeverityLevel { trace, debug, info, warn, error, critical };
 
-    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level);
+    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level) noexcept;
 
     struct Configuration {
         Configuration() : log_level(info) {}
 
-        Configuration(std::string level);
+        explicit Configuration(const std::string& level);
 
         SeverityLevel log_level;
     };
 
-    Configuration GetGlobalConfiguration();
+    Configuration GetGlobalConfiguration() noexcept;
 
     // Must be called only once and before any Logger constructors.
     void InitializeGlobalLogger(const Configuration& config);
@@ -37,12 +37,12 @@ namespace logger {
     // TODO: Use C++ 20 syncstream here instead of custom lock, when it will be properly supported.
     class LogStream {
         public:
-            LogStream(bool noop, std::string&& metadata) 
+            LogStream(bool noop, std::string&& metadata) noexcept
                 : m_noop(noop)
                 , m_metadata(std::move(metadata)) {}
 
             template<typename T>
-            LogStream& operator<<(T&& elem) {
+            LogStream& operator<<(T&& elem) noexcept {
                 if (m_noop) {
                     return *this;
                 }
@@ -52,19 +52,19 @@ namespace logger {
                 return *this;
             }
 
-            ~LogStream();
+            ~LogStream() noexcept;
 
         private:
             const bool m_noop = false;
 
             std::stringstream m_message;
 
-            std::string m_metadata;
+            const std::string m_metadata;
     };
 
     class BasicFormatter {
         public:
-            BasicFormatter() = default;
+            BasicFormatter() noexcept = default;
 
             template<typename T>
             std::string FormatPair(std::string&& key, T&& value) const {
@@ -92,40 +92,44 @@ namespace logger {
     template<typename Formatter = BasicFormatter>
     struct Logger {
         public:
-            Logger()
+            Logger() noexcept
                 : m_config(GetGlobalConfiguration())
-                , m_formatter(std::make_shared<BasicFormatter>()) {
-                }
+                , m_formatter(std::make_shared<BasicFormatter>()) {}
 
-            explicit Logger(const Configuration& config) 
+            explicit Logger(const Configuration& config) noexcept
                 : m_config(config)
-                , m_formatter(std::make_shared<BasicFormatter>()) {
-                }
+                , m_formatter(std::make_shared<BasicFormatter>()) {}
 
-            Logger(const Configuration& config, std::shared_ptr<Formatter> formatter) 
+            Logger(const Configuration& config, std::shared_ptr<Formatter> formatter) noexcept
                 : m_config(config)
-                , m_formatter(formatter) {
-                }
+                , m_formatter(formatter) {}
 
             Logger(const Configuration& config, std::shared_ptr<Formatter> formatter, 
-                std::string&& metadata) 
+                std::string&& metadata) noexcept
                 : m_config(config)
                 , m_formatter(formatter)
                 , m_metadata(std::move(metadata)) {}
 
             Logger(const Logger& l) = default;
 
-            LogStream Log(SeverityLevel severity) const {
-                if (severity < m_config.log_level) {
-                    return LogStream(true, "");
+            LogStream Log(SeverityLevel severity) const noexcept {
+                std::string metadata = "";
+
+                try {
+                    if (severity < m_config.log_level) {
+                        return LogStream(true, std::move(metadata));
+                    }
+
+                    metadata = m_formatter->FormatPair("Severity", severity) +
+                        " " +
+                        m_formatter->FormatTime("Time") +
+                        " " + 
+                        m_metadata;
+                } catch (const std::exception& e) {
+                    std::cout << "Unable to construct a LogStream: " << e.what() << ".";
+                    return LogStream(true, std::move(metadata));
                 }
-
-                std::string metadata = m_formatter->FormatPair("Severity", severity) +
-                    " " +
-                    m_formatter->FormatTime("Time") +
-                    " " + 
-                    m_metadata;
-
+                
                 return LogStream(false, std::move(metadata));
             }
             

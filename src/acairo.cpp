@@ -6,22 +6,29 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <csignal>
 
 #include <sstream>
 #include <iostream>
 #include <cassert>
 #include <optional>
 
-// Use (void) to silent unused warnings.
+// Use (void) cast to silent unused warnings.
 #define assertm(exp, msg) assert(((void)msg, exp))
 
 #include "acairo.h"
 
 namespace acairo {
-    std::string error_with_errno(const std::string& message){
-        std::stringstream ss{};
-        ss << message << ": " << strerror(errno) << ".";
-        return ss.str();
+    std::string error_with_errno(const std::string& message) noexcept {
+        try {
+            std::stringstream ss{};
+            ss << message << ": " << strerror(errno) << ".";
+            return ss.str();
+        } catch (const std::exception& e) {
+            std::cout << "Failure while error_with_errno: " << e.what() << ".";
+        }
+        
+        return "";
     }
 
     std::ostream& operator<<(std::ostream& os, const EVENT_TYPE& event_type) {
@@ -41,7 +48,7 @@ namespace acairo {
 
     // Retry syscalls on EINTR
     template<typename F, typename... Args>
-    int retry_sys_call(F&& f, Args&&... args) {
+    int retry_sys_call(F&& f, Args&&... args) noexcept {
         while (true) {
             int result = f(std::forward<Args>(args)...);
             if (result < 0 && errno == EINTR) {
@@ -60,9 +67,9 @@ namespace acairo {
         int error = 0;
         socklen_t errlen = sizeof(error);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
-            LOG(l, logger::error) << error_with_errno("Error occured on a socket");
+            LOG(l, logger::error) << "Error occured on a socket:" << error << ".";
         } else {
-            LOG(l, logger::error) << "Error occured on a socket, but unable to get socket error.";
+            LOG(l, logger::error) << error_with_errno("Error occured on a socket, but unable to get it.");
         }
     }
 
@@ -121,17 +128,21 @@ namespace acairo {
         }
     }
 
-    void Scheduler::start_worker() {
+    void Scheduler::run_worker() noexcept {
         while (!m_stopped) {
-            auto work_unit = this->get_new_work_unit();
+            WorkUnit::id_type work_id{};
 
             try {
+                auto work_unit = this->get_new_work_unit();
+
                 if (work_unit) {
+                    work_id = work_unit->get_id();
+                    
                     work_unit->operator()();
-                    LOG(m_l, logger::debug) << "Successfully finished work unit: " << work_unit->get_id();
+                    LOG(m_l, logger::debug) << "Successfully finished work unit: " << work_id;
                 }
-            } catch(const std::exception& e) {
-                LOG(m_l, logger::error) << "Work unit [" << work_unit->get_id() << "] failed with an error: " << e.what();
+            } catch (const std::exception& e) {
+                LOG(m_l, logger::error) << "Work unit [" << work_id << "] failed with an error: " << e.what() << ".";
             }
         }
     }
@@ -153,7 +164,7 @@ namespace acairo {
     }
 
     Executor::Executor(const ExecutorConfiguration& config) 
-    : m_scheduler(std::make_unique<Scheduler>(config.scheduler_config))
+    : m_scheduler(std::make_shared<Scheduler>(config.scheduler_config))
     , m_config(config)
     , m_l(logger::Logger().WithPair("Component", "Executor")) {
         m_epoll_fd = epoll_create1(0);
@@ -162,6 +173,21 @@ namespace acairo {
         }
 
         m_epoll_thread = std::thread(&Executor::run_epoll_listener, this);
+    }
+
+    // register_fd must be called once for a given fd
+    void Executor::register_fd(int fd) const {
+        LOG(m_l, logger::debug) << "Registering fd [" << fd << "] to the epoll interest list.";
+
+        // We need edge-triggered notifications as we will be invoking handlers based on incoming events.
+        // We start listening on EPOLLIN and EPOLLOUT at the same time, although the user might only need one
+        // direction. However, by using edge-triggered notifications, we shouldn't worsen our perf.
+        struct epoll_event accept_event;
+        accept_event.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        accept_event.data.fd = fd;
+        if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_ADD, fd, &accept_event) < 0) {
+            throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
+        }
     }
 
     template<typename Callable>
@@ -174,39 +200,23 @@ namespace acairo {
         LOG(m_l, logger::debug) << "Registering callback for fd [" << fd << "] and event [" << event_type << "].";
 
         std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
-        
-        // If there is a coroutine waiting for the fd, it must have been already registered with epoll.
-        // Otherwise, register it.
-        if (m_coroutines_map.find(socket_event_key) == m_coroutines_map.end()) {  
-            LOG(m_l, logger::debug) << "Adding fd [" << fd << "] and event [" << event_type << "] to the epoll interest list.";
-
-            // We need an edge-triggered notifications as we will be invoking handlers based on incoming events 
-            struct epoll_event accept_event;
-            accept_event.events = get_epoll_event_type(socket_event_key.event_type) | EPOLLET;
-            accept_event.data.fd = socket_event_key.fd;
-            if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_ADD, socket_event_key.fd, &accept_event) < 0) {
-                throw std::runtime_error(error_with_errno("Unable to add new socket to the epoll interest list"));
-            }
-        }
-
-        m_coroutines_map[socket_event_key].push_back(Scheduler::WorkUnit(std::forward<Callable>(callable)));
+        m_coroutines_map.try_emplace(socket_event_key, m_scheduler);
+        m_coroutines_map[socket_event_key].set_callback(Scheduler::WorkUnit(std::forward<Callable>(callable)));
     }
 
+    // TODO: What to do if this throws?
     void Executor::run_epoll_listener() {
         auto events = std::make_unique<struct epoll_event[]>(m_config.max_number_of_fds);
 
         auto schedule_ready_tasks = [this](const SocketEventKey& event_key){
-            auto& tasks = m_coroutines_map[event_key];
-            for (auto it = tasks.begin(); it != tasks.end(); it++) {
-                m_scheduler->spawn(Scheduler::WorkUnit(std::move(*it)));
-            }
-
-            tasks.clear();
+            // Try emplacing an event key if one is not in the map. That way we can call 
+            // a handler that will be registered later.
+            auto [it, ok] = m_coroutines_map.try_emplace(event_key, m_scheduler);
+            it->second.schedule();  
         };
 
-        while (!m_stopped) {
-            // TODO: Make epoll_wait waiting time configurable
-            const int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events.get(), m_config.max_number_of_fds, 10);
+        while (!m_stopping) {
+            const int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, events.get(), m_config.max_number_of_fds, 10); 
             if (count_of_ready_fds < 0) {
                 throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
             }
@@ -228,7 +238,7 @@ namespace acairo {
 
                     continue;
                 }
-               
+            
                 // EPOLLIN and EPOLLOUT should be also called when the peer closed that end of the socket.
                 // Therefore, it doesn't seem that we need to handle any special events connected
                 // with unexpected peer socket shutdown here.
@@ -251,48 +261,32 @@ namespace acairo {
         }
     }
 
-    void Executor::deregister_fd(int fd){
-        bool fd_was_registered = false;
+    void Executor::deregister_event_handler(int fd, EVENT_TYPE event_type) {
+        std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
 
-        // Firstly remove all the registered handlers associated with the fd
-        {
-            auto erase_key_func = [&fd_was_registered, this](const SocketEventKey& socket_event_key){
-                if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
-                    fd_was_registered = true;
+        auto socket_event_key = SocketEventKey{
+            fd: fd,
+            event_type: event_type,
+        };
 
-                    if (m_coroutines_map[socket_event_key].size() != 0) {
-                        LOG(m_l, logger::warn) << socket_event_key.event_type << " event handlers for fd" << 
-                            socket_event_key.fd << " active while deregistering fd from epoll.";
-                    }
-
-                    m_coroutines_map.erase(socket_event_key);
-                };
-            };
-
-            std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
-
-            auto socket_event_key_in = SocketEventKey{
-                fd: fd,
-                event_type: EVENT_TYPE::IN,
-            };
-            erase_key_func(socket_event_key_in);
-
-            auto socket_event_key_out = SocketEventKey{
-                fd: fd,
-                event_type: EVENT_TYPE::OUT,
-            };
-            erase_key_func(socket_event_key_out);
-        }
-        
-        // We remove the fd from the epoll interest list if it was added there before
-        if (fd_was_registered) {
-            LOG(m_l, logger::debug) << "Removing fd " << fd << " from the epoll interest list.";
-
-            // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
-            // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
-            if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_DEL, fd, (struct epoll_event *)nullptr) < 0) {
-                throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
+        if (m_coroutines_map.find(socket_event_key) != m_coroutines_map.end()) { 
+            if (m_coroutines_map[socket_event_key].has_callback()) {
+                LOG(m_l, logger::warn) << socket_event_key.event_type << " event handlers for fd" << 
+                    socket_event_key.fd << " active while deregistering fd from coroutines map.";
             }
+
+            m_coroutines_map.erase(socket_event_key);
+        }
+    }
+
+    void Executor::deregister_fd(int fd) const {
+        // We remove the fd from the epoll interest list if it was added there before
+        LOG(m_l, logger::debug) << "Removing fd " << fd << " from the epoll interest list.";
+
+        // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
+        // is ignored. Since Linux 2.6.9, event can be specified as NULL when using EPOLL_CTL_DEL.
+        if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_DEL, fd, (struct epoll_event *)nullptr) < 0) {
+            throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
         }
     }
 
@@ -309,8 +303,48 @@ namespace acairo {
         }
     }
 
+    // We just wait until the promise calls final_suspend (or throws) as we know there 
+    // is no continuation after the promise returns (i.e. the coroutine
+    // will get destroyed after the work unit finished).
+    // We also handle the case when the coroutine is suspended and the executor is getting stopped.
+    void Executor::sync_wait(std::function<Task<void>()>&& handler) {
+        auto task = spawn_final_task(std::move(handler));
+
+        auto sync_waiter = task.get_coroutine_waiter();
+        auto coroutine_state = task.get_coroutine_state();
+
+        // Set m_sync_waiter that will be used to signal stopping of the executor
+        {
+            std::lock_guard<std::mutex> lock(m_sync_waiter_mutex);
+            m_sync_waiter = sync_waiter;
+        }
+       
+        std::unique_lock<std::mutex> lock(sync_waiter->m);
+        if (!coroutine_state->done) {
+            sync_waiter->cv.wait(lock, [coroutine_state, this]{ return coroutine_state->done.load() || m_stopped; });
+        }
+
+        if (m_stopped) {
+            // Try destryoing the underlying coroutine handle, as scheduler is stopped
+            // and it is guaranteed no work unit can be running. Therefore it should
+            // be safe to destroy the coroutine.
+            task.destroy();
+            return;
+        }
+    
+        if (coroutine_state->exception_ptr != nullptr) {
+            std::rethrow_exception(coroutine_state->exception_ptr);
+        }
+    }
+
+    FinalTask spawn_final_task(std::function<Task<void>()>&& awaitable) {
+        co_await awaitable();
+    }
+
     Executor::~Executor() {
-        stop();
+        if (!m_stopped) {
+            stop();
+        }
 
         if (m_epoll_fd >= 0) {
             if (retry_sys_call(::close, m_epoll_fd) < 0) {
@@ -318,6 +352,31 @@ namespace acairo {
             }
         }
     }
+
+    // TODO: finish
+    FinalTask::FinalTask(std::coroutine_handle<promise_type> handle)
+        : m_handle(handle) 
+        , m_waiter(std::make_shared<SynchronizedWaiter>())
+        , m_state(std::make_shared<CoroutineState>())
+        , m_id(generate_id()) {
+            auto l = logger::Logger();
+            LOG(l, logger::info) << "Task(): " << m_id;
+
+            m_handle.promise().on_finish_callback(
+                [waiter = this->m_waiter, state = this->m_state](){
+                    {
+                        std::unique_lock<std::mutex> lock(waiter->m);      
+                        state->exception_ptr = std::current_exception();
+                        state->done = true;
+                    }
+
+                    waiter->cv.notify_one();
+                }
+            );
+
+            m_handle.promise().set_id(m_id);
+            m_handle.promise().no_final_suspend();
+        }
 
     acairo::Task<std::vector<char>> TCPStream::read(size_t number_of_bytes) {
         using namespace std::chrono_literals;
@@ -369,12 +428,15 @@ namespace acairo {
 
     // Firstly, deregister fd from epoll and then close it
     // https://idea.popcount.org/2017-03-20-epoll-is-fundamentally-broken-22/
-    TCPStream::~TCPStream() {
+    TCPStream::~TCPStream() noexcept {
         LOG(m_l, logger::debug) << "Destructing fd.";
 
         // Deregistering a fd can throw, so in case it throws we just log the error and continue
-        // as there is not much we can do about it and we (probably?) want the program to continue
+        // as there is not much we can do about it and we want the program to continue
         try {
+            m_executor->deregister_event_handler(m_fd, EVENT_TYPE::IN);
+            m_executor->deregister_event_handler(m_fd, EVENT_TYPE::OUT);
+
             m_executor->deregister_fd(m_fd);
         } catch(const std::exception& e){
             LOG(m_l, logger::error) << "Unable to deregister fd: " << e.what() << ".";
@@ -427,78 +489,69 @@ namespace acairo {
         }
 
         m_listener_sockfd = sockfd;
+
+        m_executor->register_fd(m_listener_sockfd);
     }
 
-    // Using just single epoll listener, as it should suffice our purposes.
-    // A great article explaining all the problems with multi-threaded epoll: 
-    // https://idea.popcount.org/2017-02-20-epoll-is-fundamentally-broken-12/
-    std::shared_ptr<TCPStream> TCPListener::accept() {
+    Task<std::shared_ptr<TCPStream>> TCPListener::accept() const {
         if (m_listener_sockfd <= 0) {
             throw std::runtime_error("Listening socket was not initialized.");
         }
 
         int accepted_conn_fd = -1;
-        while (!m_stopped && accepted_conn_fd < 0) {
-            auto event = std::make_unique<struct epoll_event>();
-
-            // We just wait for max 10ms on epoll until it returns
-            // If there are no new events, we continue looping.
-            // Otherwise, we accept new socket.
-            int count_of_ready_fds = retry_sys_call(epoll_wait, m_epoll_fd, &(*event), 1, 10);
-            if (count_of_ready_fds < 0) {
-                throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
-            } else if (count_of_ready_fds == 0) {
-                continue;
-            }
-
-            if (event->events & EPOLLERR) {
-                log_socket_error(event->data.fd);
-                continue;
-            }
-
+        while (accepted_conn_fd < 0) {
             struct sockaddr_in peer_addr;
             socklen_t peer_addr_len = sizeof(peer_addr);
             accepted_conn_fd = retry_sys_call(::accept, m_listener_sockfd, (struct sockaddr*)&peer_addr, &peer_addr_len);
-            if (accepted_conn_fd < 0) {
+             if (accepted_conn_fd < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    LOG(m_l, logger::warn) << "EAGAIN or EWOULDBLOCK after accepting a new connection. Going to wait for new connection.";
+                    co_await AcceptFuture(m_executor, m_listener_sockfd);
                     continue;
+                }
+
+                // Even though m_stopped might be set, but the fd hasn't been closed yet and the error
+                // received was something else, we throw TCPListenerStoppedError as the acceptor 
+                // is expected to be stopped nonetheless.
+                if (m_stopped) {
+                    throw TCPListenerStoppedError();
                 } else {
-                    LOG(m_l, logger::error) << error_with_errno("Failure when accepting a new connection");
-                    continue;
+                    throw std::runtime_error(error_with_errno("Unable to accept new connection"));
                 }
             }
 
             LOG(m_l, logger::debug) << "Accepted new connection: " << accepted_conn_fd << ".";
         }
-
-        if (m_stopped) {
-            throw TCPListenerStoppedError();
-        }
         
         make_socket_non_blocking(accepted_conn_fd);
         
-        return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd, m_executor);   
+        co_return std::make_shared<TCPStream>(m_config.stream_config, accepted_conn_fd, m_executor);   
     }
 
-    void TCPListener::shutdown() {
+    void TCPListener::stop() noexcept {
+        LOG(m_l, logger::debug) << "Destructing listener fd.";
+
         m_stopped = true;
-    }
 
-    TCPListener::~TCPListener(){
-        shutdown();
+        // Deregistering a fd can throw, so in case it throws we just log the error and continue
+        // as there is not much we can do about it and we want the program to continue
+        try {
+            m_executor->deregister_event_handler(m_listener_sockfd, EVENT_TYPE::IN);
+            m_executor->deregister_event_handler(m_listener_sockfd, EVENT_TYPE::OUT);
 
-         if (m_epoll_fd >= 0) {
-            if (retry_sys_call(::close, m_epoll_fd) < 0) {
-                LOG(m_l, logger::error) << error_with_errno("Unable to close listening epoll fd");
-            }
+            m_executor->deregister_fd(m_listener_sockfd);
+        } catch(const std::exception& e){
+            LOG(m_l, logger::error) << "Unable to deregister listener fd: " << e.what() << ".";
         }
 
-        if (m_listener_sockfd >= 0) {
-            if (retry_sys_call(::close, m_listener_sockfd) < 0) {
-                auto l = m_l.WithPair("fd", m_listener_sockfd);
-                LOG(l, logger::error) << error_with_errno("Unable to close listener fd");
-            }
-        }   
+        // close shouldn't block on non-blocking sockets
+        if (retry_sys_call(::close, m_listener_sockfd) < 0) {
+            LOG(m_l, logger::error) << error_with_errno("Unable to close file descriptor");
+        }
+    }
+
+    TCPListener::~TCPListener() noexcept {
+        if (!m_stopped) {
+            stop();
+        }
     }
 }

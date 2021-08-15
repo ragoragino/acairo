@@ -30,6 +30,17 @@ acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     }
 }
 
+acairo::Task<void> handle_accept(std::shared_ptr<acairo::Executor> executor,
+    const acairo::TCPListener& listener) {   
+    while (true) {
+        auto stream = co_await listener.accept();
+
+        auto handler = std::bind(handle_socket, stream);
+
+        executor->spawn(std::move(handler));
+    }
+}
+
 int main(){
     using namespace acairo;
 
@@ -40,6 +51,7 @@ int main(){
     logger::InitializeGlobalLogger(log_config);
     auto l = logger::Logger().WithPair("Component", "main");
 
+    // TODO: Allow draining
     SchedulerConfiguration scheduler_config{
         number_of_worker_threads: 10,
     };
@@ -81,7 +93,7 @@ int main(){
 
         LOG(l, logger::debug) << "Shutting down cairo.";
 
-        listener.shutdown();
+        listener.stop();
 
         LOG(l, logger::debug) << "Listener stopped.";
 
@@ -92,32 +104,28 @@ int main(){
 
     listener.bind("127.0.0.1:8080");
 
+    // TODO: Add listen call
+
     LOG(l, logger::info) << "Starting to accept new connections.";
 
-    while(true) {
-        try { 
-            auto stream = listener.accept();
-
-            auto handler = std::bind(handle_socket, stream);
-
-            executor->spawn(std::move(handler));
-        } catch(const TCPListenerStoppedError& e) {
-            if (sig_flag == 1) {
-                break;
-            }
-
+    try { 
+        auto f = std::bind(handle_accept, executor, std::ref(listener));
+        executor->sync_wait(std::move(f));
+        
+        // sync_wait stopped due to the handler stopping
+        force_shutdown = 1;
+    } catch (const TCPListenerStoppedError& e) {
+        if (sig_flag == 0) {
+            LOG(l, logger::info) << "TCPListener stopped unexpectedly."; 
             force_shutdown = 1;
-            shutdown_handler.join();
-
-            throw;
-        } catch(const std::exception& e) {
-            force_shutdown = 1;
-            shutdown_handler.join();
-
-            throw;
         }
-    }
+    } catch (const std::exception& e) {
+        force_shutdown = 1;
+        shutdown_handler.join();
 
+        throw;
+    }
+    
     shutdown_handler.join();
 
     return 0;

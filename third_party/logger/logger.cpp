@@ -48,11 +48,11 @@ namespace logger {
         }
     }
 
-    Configuration::Configuration(std::string level) { 
+    Configuration::Configuration(const std::string& level) { 
         log_level = SeverityLevelFromString(level); 
     };
 
-    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level) {
+    std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level) noexcept {
         static const char* strings[] = {"trace", "debug", "info", "warn", "error", "critical"};
 
         if (static_cast<size_t>(level) < sizeof(strings) / sizeof(*strings)) {
@@ -68,22 +68,26 @@ namespace logger {
         m_global_config = configuration;
     }
 
-    Configuration GetGlobalConfiguration() {
+    Configuration GetGlobalConfiguration() noexcept {
         return m_global_config;
     }
 
-    LogStream::~LogStream() {
-        if (m_noop) {
-            return;
-        }
+    LogStream::~LogStream() noexcept {
+        try {
+            if (m_noop) {
+                return;
+            }
 
-        std::string delimiter = "";
-        if (!m_metadata.empty()) {
-            delimiter = ": ";
-        }
+            std::string delimiter = "";
+            if (!m_metadata.empty()) {
+                delimiter = ": ";
+            }
 
-        std::lock_guard<std::mutex> lock(stdout_mutex);
-        std::cout << m_metadata << delimiter << m_message.str() << "\n";
+            std::lock_guard<std::mutex> lock(stdout_mutex);
+            std::cout << m_metadata << delimiter << m_message.str() << "\n";
+        } catch (const std::exception& e) {
+            std::cout << "Unable to destruct LogStream: " << e.what() << ".\n";
+        }
     }
 
 }  // namespace logger
