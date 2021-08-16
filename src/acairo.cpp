@@ -375,7 +375,6 @@ namespace acairo {
             );
 
             m_handle.promise().set_id(m_id);
-            m_handle.promise().no_final_suspend();
         }
 
     acairo::Task<std::vector<char>> TCPStream::read(size_t number_of_bytes) {
@@ -472,25 +471,21 @@ namespace acairo {
             throw std::runtime_error(error_with_errno("Unable to bind socket to the address"));
         }
 
-        if (listen(sockfd, m_config.max_number_of_queued_conns) < 0) {
+        m_listener_sockfd = sockfd;
+    }
+
+    void TCPListener::listen() const {
+        if (m_listener_sockfd <= 0) {
+            throw std::runtime_error("Listening socket was not bint to an endpoint.");
+        }
+
+        if (::listen(m_listener_sockfd, m_config.max_number_of_queued_conns) < 0) {
             throw std::runtime_error(error_with_errno("Unable to mark the socket as a listening socket"));
         }
 
-        make_socket_non_blocking(sockfd);
+        make_socket_non_blocking(m_listener_sockfd);
 
-        m_epoll_fd = epoll_create1(0);
-        if (m_epoll_fd < 0) {
-            throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
-        }
-
-        m_accept_event.events = EPOLLIN;
-        if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_ADD, sockfd, &m_accept_event) < 0) {
-            throw std::runtime_error(error_with_errno("Unable to add listener socket to the epoll interest list"));
-        }
-
-        m_listener_sockfd = sockfd;
-
-        m_executor->register_fd(m_listener_sockfd);
+        m_executor->register_fd(m_listener_sockfd);        
     }
 
     Task<std::shared_ptr<TCPStream>> TCPListener::accept() const {

@@ -530,30 +530,65 @@ namespace acairo {
         public:
             using id_type = detail::Types::ID;
 
-            ContinuationAwaiter(bool ready, id_type id) noexcept
-                : m_ready(ready) 
+            ContinuationAwaiter(std::function<void()>&& on_finish, bool exception_thrown, id_type id) noexcept
+                : m_on_finish(std::move(on_finish))
+                , m_exception_thrown(exception_thrown)
                 , m_id(id) {};
             
             bool await_ready() const noexcept { 
-                return m_ready; 
+                return false; 
             }
 
             void await_suspend(std::coroutine_handle<Promise<T>> handle) const noexcept {
+                try {
+                    if (m_on_finish) {
+                        m_on_finish();
+                    }
+                } catch (const std::exception& e) {
+                    auto l = logger::Logger();
+                    LOG(l, logger::error) << "Exception thrown when calling on_finish during "
+                        "await_suspend in ContinuationAwaiter.";
+                }
+
+                // If an exception was thrown, there is no reason to resume any continuations,
+                // we just destroy them together with the current coroutine.
+                // Destroying current coroutine is safe at this point: 
+                // https://lewissbaker.github.io/2018/09/05/understanding-the-promise-type.
+                // TODO: Destroy all continuations
+                if (m_exception_thrown) {
+                    handle.destroy();
+                    
+                    return;
+                }
+
                 auto continuation = handle.promise().get_continuation();
                 if (continuation && !continuation.done()) {
                     continuation.resume();
                 } 
             }
 
-            // Awaiting when the promise type is FinalTaskPromise. 
-            // This is a pro-forma function as it won't be ever called, because FinalTask
-            // will be always ready.
-            void await_suspend(std::coroutine_handle<FinalTaskPromise>) const noexcept {}
+            // Awaiting when the promise type is FinalTaskPromise. We don't resume
+            // any continuations here as this is the final one. We also return false
+            // to finish the coroutine.
+            bool await_suspend(std::coroutine_handle<FinalTaskPromise>) const noexcept {
+                try {
+                    if (m_on_finish) {
+                        m_on_finish();
+                    }
+                } catch (const std::exception& e) {
+                    auto l = logger::Logger();
+                    LOG(l, logger::error) << "Exception thrown when calling on_finish during "  
+                        "await_suspend in ContinuationAwaiter.";
+                }
+
+                return false;
+            }
 
             void await_resume() const noexcept {}
         
         private:
-            const bool m_ready;
+            std::function<void()> m_on_finish;
+            const bool m_exception_thrown;
             const id_type m_id;
     };
 
@@ -581,17 +616,8 @@ namespace acairo {
                 return {};
             }
 
-            ContinuationAwaiter<T> final_suspend() noexcept {
-                auto l = logger::Logger();
-               
-                // TODO: Is this the right place for this?
-                // TODO: Make on_finish noexcept
-                // At this point, the coroutine is suspended, and mustn't resume itself.
-                if (m_on_finish) {
-                    m_on_finish();
-                }
-
-                return ContinuationAwaiter<T>(m_no_final_suspend, m_id); 
+            ContinuationAwaiter<T> final_suspend() noexcept {              
+                return ContinuationAwaiter<T>(std::move(m_on_finish), m_unhandled_exception, m_id); 
             }
 
             void on_finish_callback(std::function<void()>&& on_finish){
@@ -609,12 +635,9 @@ namespace acairo {
             approach when you have full control over who/what calls resume().
             */
             void unhandled_exception() noexcept {
-                if (m_on_finish) {
-                    m_on_finish();
-                }
+                m_unhandled_exception = true;
 
-                // We don't throw exceptions as they might be called from functions that must be noexcept,
-                // like e.g. ContinuationAwaiter await_suspend.
+                // We don't throw exceptions as we want to final_suspend to co-await the ContinuationAwaiter.
                 auto l = logger::Logger();
                 try {
                     auto eptr = std::current_exception();
@@ -631,10 +654,6 @@ namespace acairo {
 
             std::coroutine_handle<> get_continuation() const noexcept {
                 return m_continuation;
-            }
-
-            void no_final_suspend() noexcept {
-                m_no_final_suspend = true;
             }
 
             void set_id(unsigned long long id) {
@@ -662,7 +681,7 @@ namespace acairo {
             };
 
         private:
-            bool m_no_final_suspend = false;
+            bool m_unhandled_exception = false;
             std::coroutine_handle<> m_continuation;
             std::function<void()> m_on_finish;
 
@@ -761,6 +780,8 @@ namespace acairo {
                 , m_l(logger::Logger().WithPair("Component", "TCPListener")) {}
 
             void bind(const std::string& address);
+            
+            void listen() const;
 
             Task<std::shared_ptr<TCPStream>> accept() const;
 

@@ -9,7 +9,6 @@ Still work in progress!
 
 
 // Valgrind
-valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --log-file=valgrind.txt ./executable acairomain
+valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --log-file=valgrind.txt ./acairomain
 
-// TODO: Add listen call \
-// TODO: When to call on_finish?
+// TODO: Destroying chained coroutines after exceptions are thrown.
