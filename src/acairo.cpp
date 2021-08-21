@@ -10,11 +10,7 @@
 
 #include <sstream>
 #include <iostream>
-#include <cassert>
 #include <optional>
-
-// Use (void) cast to silent unused warnings.
-#define assertm(exp, msg) assert(((void)msg, exp))
 
 #include "acairo.h"
 
@@ -115,7 +111,7 @@ namespace acairo {
         }
 
         m_work_queue_cv.notify_one();
-    };
+    }
 
     void Scheduler::stop() {
         m_stopped = true;
@@ -353,7 +349,6 @@ namespace acairo {
         }
     }
 
-    // TODO: finish
     FinalTask::FinalTask(std::coroutine_handle<promise_type> handle)
         : m_handle(handle) 
         , m_waiter(std::make_shared<SynchronizedWaiter>())

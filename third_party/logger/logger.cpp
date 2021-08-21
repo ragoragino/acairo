@@ -50,7 +50,7 @@ namespace logger {
 
     Configuration::Configuration(const std::string& level) { 
         log_level = SeverityLevelFromString(level); 
-    };
+    }
 
     std::ostream& operator<<(std::ostream& stream, const SeverityLevel& level) noexcept {
         static const char* strings[] = {"trace", "debug", "info", "warn", "error", "critical"};

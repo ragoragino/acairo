@@ -297,7 +297,7 @@ namespace cairo {
         }
 
         m_work_queue_cv.notify_one();
-    };
+    }
 
     void Executor::stop() {
         m_stopped = true;

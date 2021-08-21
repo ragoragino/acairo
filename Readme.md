@@ -11,4 +11,4 @@ Still work in progress!
 // Valgrind
 valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --log-file=valgrind.txt ./acairomain
 
-// TODO: Destroying chained coroutines after exceptions are thrown.
+// Read about symmetric transfer -> https://lewissbaker.github.io/2020/05/11/understanding_symmetric_transfer

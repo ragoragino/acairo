@@ -14,9 +14,13 @@
 #include <memory>
 #include <unordered_map>
 #include <coroutine>
+#include <cassert>
 #include <sys/epoll.h>
 
 #include "logger.hpp"
+
+// Use (void) cast to silent unused warnings.
+#define assertm(exp, msg) assert(((void)msg, exp))
 
 namespace acairo {
     // We define all types commonly used at the namespace level, so they
@@ -404,11 +408,12 @@ namespace acairo {
                 return m_handle.done();
             }
 
-            void await_suspend(std::coroutine_handle<> handle) const noexcept {
+            template<typename F>
+            void await_suspend(std::coroutine_handle<F> handle) const noexcept {
                 m_handle.promise().set_continuation(handle);
             }
 
-            T await_resume() const noexcept {
+            T await_resume() const {
                 return m_handle.promise().get_return_value();
             }
 
@@ -528,68 +533,47 @@ namespace acairo {
     template<typename T>
     class ContinuationAwaiter {
         public:
-            using id_type = detail::Types::ID;
-
-            ContinuationAwaiter(std::function<void()>&& on_finish, bool exception_thrown, id_type id) noexcept
-                : m_on_finish(std::move(on_finish))
-                , m_exception_thrown(exception_thrown)
-                , m_id(id) {};
+            ContinuationAwaiter() noexcept {};
             
             bool await_ready() const noexcept { 
                 return false; 
             }
 
-            void await_suspend(std::coroutine_handle<Promise<T>> handle) const noexcept {
+            template<typename PromiseType,
+                typename = typename std::enable_if_t<!std::is_same<PromiseType, FinalTaskPromise>::value, PromiseType>>
+            void await_suspend(std::coroutine_handle<PromiseType> handle) const noexcept {
                 try {
-                    if (m_on_finish) {
-                        m_on_finish();
-                    }
+                    handle.promise().on_finish();
                 } catch (const std::exception& e) {
                     auto l = logger::Logger();
-                    LOG(l, logger::error) << "Exception thrown when calling on_finish during "
-                        "await_suspend in ContinuationAwaiter.";
-                }
-
-                // If an exception was thrown, there is no reason to resume any continuations,
-                // we just destroy them together with the current coroutine.
-                // Destroying current coroutine is safe at this point: 
-                // https://lewissbaker.github.io/2018/09/05/understanding-the-promise-type.
-                // TODO: Destroy all continuations
-                if (m_exception_thrown) {
-                    handle.destroy();
-                    
-                    return;
+                    LOG(l, logger::error) << "Exception thrown when calling on_finish during "  
+                        "await_suspend in ContinuationAwaiter: " << e.what() << ".";
                 }
 
                 auto continuation = handle.promise().get_continuation();
                 if (continuation && !continuation.done()) {
                     continuation.resume();
-                } 
+                }               
             }
 
             // Awaiting when the promise type is FinalTaskPromise. We don't resume
             // any continuations here as this is the final one. We also return false
             // to finish the coroutine.
-            bool await_suspend(std::coroutine_handle<FinalTaskPromise>) const noexcept {
+            template<typename PromiseType,
+                typename = typename std::enable_if_t<std::is_same<PromiseType, FinalTaskPromise>::value, PromiseType>>
+            bool await_suspend(std::coroutine_handle<PromiseType> handle) const noexcept {
                 try {
-                    if (m_on_finish) {
-                        m_on_finish();
-                    }
+                    handle.promise().on_finish();
                 } catch (const std::exception& e) {
                     auto l = logger::Logger();
                     LOG(l, logger::error) << "Exception thrown when calling on_finish during "  
-                        "await_suspend in ContinuationAwaiter.";
+                        "await_suspend in ContinuationAwaiter: " << e.what() << ".";
                 }
 
                 return false;
             }
 
             void await_resume() const noexcept {}
-        
-        private:
-            std::function<void()> m_on_finish;
-            const bool m_exception_thrown;
-            const id_type m_id;
     };
 
     // https://devblogs.microsoft.com/oldnewthing/20210330-00/?p=105019
@@ -617,11 +601,17 @@ namespace acairo {
             }
 
             ContinuationAwaiter<T> final_suspend() noexcept {              
-                return ContinuationAwaiter<T>(std::move(m_on_finish), m_unhandled_exception, m_id); 
+                return ContinuationAwaiter<T>(); 
             }
 
-            void on_finish_callback(std::function<void()>&& on_finish){
-                m_on_finish = std::move(on_finish);                
+            void on_finish_callback(std::function<void()>&& on_finish) noexcept {
+                m_on_finish = std::move(on_finish);
+            }
+
+            void on_finish()  {
+                if (m_on_finish) {
+                    m_on_finish();
+                }
             }
 
             // https://lewissbaker.github.io/2018/09/05/understanding-the-promise-type
@@ -634,20 +624,21 @@ namespace acairo {
             to coroutine_handle::resume() to be noexcept, so you should generally only use this
             approach when you have full control over who/what calls resume().
             */
-            void unhandled_exception() noexcept {
-                m_unhandled_exception = true;
+            void unhandled_exception() {
+                m_eptr = std::current_exception();
 
-                // We don't throw exceptions as we want to final_suspend to co-await the ContinuationAwaiter.
-                auto l = logger::Logger();
                 try {
-                    auto eptr = std::current_exception();
-                    std::rethrow_exception(eptr);
+                    std::rethrow_exception(m_eptr);
                 } catch (const std::exception& e) {
+                    auto l = logger::Logger();
                     LOG(l, logger::error) << "Promise [" << m_id << "] failed with an error: " << e.what() << ".";
                 }
             }
 
-            // Not thread-safe. This should be always running synchronously with get_continuation.
+            std::exception_ptr get_exception() const noexcept {
+                return m_eptr;
+            }
+
             void set_continuation(std::coroutine_handle<> continuation) noexcept {
                 m_continuation = continuation;
             }
@@ -681,9 +672,10 @@ namespace acairo {
             };
 
         private:
-            bool m_unhandled_exception = false;
             std::coroutine_handle<> m_continuation;
+
             std::function<void()> m_on_finish;
+            std::exception_ptr m_eptr;
 
             id_type m_id;
    };
@@ -712,7 +704,11 @@ namespace acairo {
                 m_value = std::forward<T>(value);
             }
 
-            T get_return_value() const noexcept {
+            T get_return_value() const {
+                if (auto eptr = PromiseBase<T>::get_exception(); eptr) {
+                    std::rethrow_exception(eptr);
+                }
+
                 return m_value;
             }
 
@@ -733,7 +729,11 @@ namespace acairo {
 
             // get_value is not used, but needs to exist due to the Promise duality problem 
             // (see comment on PromiseBase)
-            void get_return_value() noexcept {} 
+            void get_return_value() {
+                 if (auto eptr = PromiseBase<void>::get_exception(); eptr) {
+                    std::rethrow_exception(eptr);
+                }
+            } 
     };
 
     struct TCPStreamConfiguration {

@@ -23,7 +23,7 @@ acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     std::vector<char> vector_message(send_message.begin(), send_message.end());
     co_await stream->write(std::move(vector_message));
 
-    LOG(l, logger::debug) << "Writing to socket was successful."; 
+    LOG(l, logger::debug) << "Writing to socket was successful.";
 }
 
 acairo::Task<void> handle_accept(std::shared_ptr<acairo::Executor> executor,
