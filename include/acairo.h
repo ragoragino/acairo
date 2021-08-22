@@ -409,8 +409,9 @@ namespace acairo {
             }
 
             template<typename F>
-            void await_suspend(std::coroutine_handle<F> handle) const noexcept {
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<F> handle) const noexcept {
                 m_handle.promise().set_continuation(handle);
+                return m_handle;
             }
 
             T await_resume() const {
@@ -541,7 +542,7 @@ namespace acairo {
 
             template<typename PromiseType,
                 typename = typename std::enable_if_t<!std::is_same<PromiseType, FinalTaskPromise>::value, PromiseType>>
-            void await_suspend(std::coroutine_handle<PromiseType> handle) const noexcept {
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<PromiseType> handle) const noexcept {
                 try {
                     handle.promise().on_finish();
                 } catch (const std::exception& e) {
@@ -550,10 +551,7 @@ namespace acairo {
                         "await_suspend in ContinuationAwaiter: " << e.what() << ".";
                 }
 
-                auto continuation = handle.promise().get_continuation();
-                if (continuation && !continuation.done()) {
-                    continuation.resume();
-                }               
+                return handle.promise().get_continuation();
             }
 
             // Awaiting when the promise type is FinalTaskPromise. We don't resume
@@ -592,12 +590,6 @@ namespace acairo {
             PromiseBase() {
                 auto l = logger::Logger();
                 LOG(l, logger::info) << "PromiseBase is constructed.";
-            }
-
-            std::suspend_never initial_suspend() { 
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "initial_suspend: " << m_id;
-                return {};
             }
 
             ContinuationAwaiter<T> final_suspend() noexcept {              
@@ -647,9 +639,13 @@ namespace acairo {
                 return m_continuation;
             }
 
-            void set_id(unsigned long long id) {
+            void set_id(id_type id) noexcept {
                 m_id = id;
             }
+
+            id_type get_id() const noexcept {
+                return m_id;
+            }   
 
             // By await_transform we transform awaitables - one signature is used to obtain just awaiters holding
             // instances of classes deriving from Future interface. The other signature is used for all other
@@ -684,6 +680,12 @@ namespace acairo {
         public:
             FinalTaskPromise() = default;
 
+            std::suspend_never initial_suspend() { 
+                auto l = logger::Logger();
+                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<void>::get_id();
+                return {};
+            }
+
             FinalTask get_return_object() { 
                 return FinalTask(std::coroutine_handle<FinalTaskPromise>::from_promise(*this)); 
             }
@@ -695,6 +697,12 @@ namespace acairo {
     class Promise : public PromiseBase<T> {
         public:
             Promise() = default;
+
+            std::suspend_always initial_suspend() { 
+                auto l = logger::Logger();
+                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<T>::get_id();
+                return {};
+            }
 
             Task<T> get_return_object() { 
                 return Task<T>(std::coroutine_handle<Promise<T>>::from_promise(*this)); 
@@ -720,6 +728,12 @@ namespace acairo {
     class Promise<void> : public PromiseBase<void> {
         public:
             Promise<void>() = default;
+
+            std::suspend_always initial_suspend() { 
+                auto l = logger::Logger();
+                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<void>::get_id();
+                return {};
+            }
 
             Task<void> get_return_object() { 
                 return Task<void>(std::coroutine_handle<Promise<void>>::from_promise(*this)); 
