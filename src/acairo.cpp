@@ -100,7 +100,7 @@ namespace acairo {
         }
 
         if (retry_sys_call(fcntl, fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            throw std::runtime_error(error_with_errno("Unable to set O_NONBLOCK on the socket."));
+            throw std::runtime_error(error_with_errno("Unable to set O_NONBLOCK on the fd."));
         }
     }
 
@@ -165,10 +165,18 @@ namespace acairo {
     , m_l(logger::Logger().WithPair("Component", "Executor")) {
         m_epoll_fd = epoll_create1(0);
         if (m_epoll_fd < 0) {
-            throw std::runtime_error(error_with_errno("Unable to create a fd with epoll"));
+            throw std::runtime_error(error_with_errno("Unable to create epoll instance"));
         }
 
         m_epoll_thread = std::thread(&Executor::run_epoll_listener, this);
+    }
+
+    void Executor::spawn(std::function<Task<void>()>&& awaitable) {
+        auto work_unit = [awaitable = std::move(awaitable)]() mutable {
+            auto task = spawn_final_task(std::move(awaitable));
+        };
+
+        m_scheduler->spawn(Scheduler::WorkUnit(std::move(work_unit)));
     }
 
     // register_fd must be called once for a given fd
@@ -275,8 +283,8 @@ namespace acairo {
         }
     }
 
+    // We remove the fd from the epoll interest list
     void Executor::deregister_fd(int fd) const {
-        // We remove the fd from the epoll interest list if it was added there before
         LOG(m_l, logger::debug) << "Removing fd " << fd << " from the epoll interest list.";
 
         // In kernel versions before 2.6.9, the EPOLL_CTL_DEL operation required a non-null pointer in event, even though this argument
@@ -354,14 +362,11 @@ namespace acairo {
         , m_waiter(std::make_shared<SynchronizedWaiter>())
         , m_state(std::make_shared<CoroutineState>())
         , m_id(generate_id()) {
-            auto l = logger::Logger();
-            LOG(l, logger::info) << "Task(): " << m_id;
-
             m_handle.promise().on_finish_callback(
-                [waiter = this->m_waiter, state = this->m_state](){
+                [waiter = this->m_waiter, state = this->m_state](std::exception_ptr e){
                     {
                         std::unique_lock<std::mutex> lock(waiter->m);      
-                        state->exception_ptr = std::current_exception();
+                        state->exception_ptr = e;
                         state->done = true;
                     }
 
@@ -373,8 +378,6 @@ namespace acairo {
         }
 
     acairo::Task<std::vector<char>> TCPStream::read(size_t number_of_bytes) {
-        using namespace std::chrono_literals;
-
         std::vector<char> result(number_of_bytes, 0);
 
         int remaining_buffer_size = number_of_bytes;
@@ -399,8 +402,6 @@ namespace acairo {
     }
 
     acairo::Task<void> TCPStream::write(std::vector<char>&& buffer) {
-        using namespace std::chrono_literals;
-
         int remaining_buffer_size = buffer.size();
         char* current_buffer_ptr = buffer.data();
 
@@ -436,7 +437,7 @@ namespace acairo {
             LOG(m_l, logger::error) << "Unable to deregister fd: " << e.what() << ".";
         }
 
-        // close shouldn't block on non-blocking sockets
+        // close won't block on non-blocking sockets
         if (retry_sys_call(::close, m_fd) < 0) {
             LOG(m_l, logger::error) << error_with_errno("Unable to close file descriptor");
         }

@@ -99,7 +99,7 @@ namespace acairo {
                     : m_id(generate_id())
                     , m_work_unit(std::move(work_unit)) {}
 
-                    id_type get_id() const {
+                    id_type get_id() const noexcept {
                         return m_id;
                     }
 
@@ -145,7 +145,7 @@ namespace acairo {
             const detail::Types::Logger m_l;
     };
 
-     // SocketEventCallback is a helper class to store information about epoll event and related callbacks.
+     // SocketEventCallback is a helper class to store information about epoll events and related callbacks.
      // It isn't thread-safe.
     class SocketEventCallback {
         public:
@@ -154,7 +154,7 @@ namespace acairo {
             explicit SocketEventCallback(std::shared_ptr<Scheduler> scheduler) 
                 : m_scheduler(scheduler) {};
 
-            // Either schedule the previously aved work unit or 
+            // Either schedule the previously saved work unit or 
             // mark that an unhandled event occured.
             void schedule() {
                 if (!m_scheduler) {
@@ -206,7 +206,7 @@ namespace acairo {
     struct FinalTask;
 
     // SynchronizedWaiter is a helper struct that can used to lock 
-    // object that need thread-synchronization and notify different handlers 
+    // object that need thread synchronization and notify different handlers 
     // waiting for events related to the locked object.
     struct SynchronizedWaiter {
         std::mutex m;
@@ -217,12 +217,6 @@ namespace acairo {
     // Each coroutine passed by the user should be co_await-ed
     // to obtain FinalTask. FinalTask handles proper destruction 
     // of such objects.
-    //
-    // In the beginning, I pondered whether such setting a flag from the Task
-    // (like here: https://gitlab.com/deus_ex_machina399/coroutine-async/-/blob/master/lib/include/async/Task.h#L124)
-    // wouldn't be sufficent, but it seems to me not to be free from race conditions. 
-    // That is why I have decided to create another coroutine wrapper
-    // that will be used exclusively for handling the last coroutines in the chain of coroutines.
     FinalTask spawn_final_task(std::function<Task<void>()>&& awaitable);
 
     struct ExecutorConfiguration {
@@ -236,16 +230,7 @@ namespace acairo {
 
             // enable_if_t enforces that users pass only rvalue awaitables.
             // Lvalues could potentially cause object lifetime issues.
-            // TODO: Enforce that awaitable is awaitable - maybe un-template it?
-            template<typename Awaitable,
-                typename = typename std::enable_if_t<!std::is_lvalue_reference<Awaitable>::value, Awaitable>>
-            void spawn(Awaitable&& awaitable) {
-                auto work_unit = [awaitable = std::move(awaitable)](){
-                    auto task = spawn_final_task(std::move(awaitable));
-                };
-
-                m_scheduler->spawn(Scheduler::WorkUnit(std::move(work_unit)));
-            }
+            void spawn(std::function<Task<void>()>&& awaitable);
 
             template<typename Callable>
             void register_event_handler(int fd, EVENT_TYPE event_type, Callable&& callable);
@@ -267,7 +252,7 @@ namespace acairo {
 
                 m_stopped = true;
 
-                // Notify if there is someone synchronously waiting for the coroutine (via sync_wait)
+                // Notify if there is someone synchronously waiting for the final coroutine (via sync_wait)
                 std::lock_guard<std::mutex> lock(m_sync_waiter_mutex);
                 if (m_sync_waiter) {
                     m_sync_waiter->cv.notify_one();
@@ -353,7 +338,7 @@ namespace acairo {
     class FutureAwaiter {
         public:
             FutureAwaiter(FutureType&& future_awaitable)
-                : m_future_awaitable(std::move(future_awaitable)) {}
+                : m_future_awaitable(std::forward<FutureType>(future_awaitable)) {}
             
             bool await_ready() const noexcept { 
                 return false; 
@@ -380,7 +365,13 @@ namespace acairo {
                 int fd = m_future_awaitable.get_fd();
                 EVENT_TYPE event_type = m_future_awaitable.get_event_type();
 
-                executor->register_event_handler(fd, event_type, std::move(continuation_handle));
+                try {
+                    executor->register_event_handler(fd, event_type, std::move(continuation_handle));
+                } catch (const std::exception& e) {
+                    auto l = logger::Logger();
+                    LOG(l, logger::error) << "Registering callback for fd [" << fd << "] and event [" 
+                        << event_type << "] failed: " << e.what() << ".";
+                }
             }
 
             void await_resume() const noexcept {}
@@ -396,8 +387,6 @@ namespace acairo {
     class FinalTaskPromise;
 
     // Awaits Task object
-    // TaskAwaiter must be always resumed before the awaited coroutine gets destroyed.
-    // Otherwise, the handle will become dangling.
     template<typename T>
     class TaskAwaiter {
         public:
@@ -408,8 +397,8 @@ namespace acairo {
                 return m_handle.done();
             }
 
-            template<typename F>
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<F> handle) const noexcept {
+            template<typename ContinuationPromiseType>
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<ContinuationPromiseType> handle) const noexcept {
                 m_handle.promise().set_continuation(handle);
                 return m_handle;
             }
@@ -432,9 +421,6 @@ namespace acairo {
             Task(std::coroutine_handle<promise_type> handle)
                 : m_handle(handle) 
                 , m_id(generate_id()) {
-                    auto l = logger::Logger();
-                    LOG(l, logger::info) << "Task(): " << m_id;
-
                     m_handle.promise().set_id(m_id);
                 }
 
@@ -459,10 +445,7 @@ namespace acairo {
                 return m_handle.done();
             }
 
-            ~Task() { 
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "~Task: " << m_id << ".";
-
+            ~Task() {
                 if (m_handle) {
                     m_handle.destroy(); 
                 }
@@ -474,7 +457,7 @@ namespace acairo {
     };
 
     // Coroutine state is a helper struct that gathers information 
-    // about the state of the coroutien
+    // about the state of the coroutine
     struct CoroutineState {
         std::exception_ptr exception_ptr;
         std::atomic_bool done;
@@ -529,8 +512,7 @@ namespace acairo {
             id_type m_id;
     };
 
-   // ContinuationAwaiter waits during final_suspend of the promise for the resumption of continuations.
-   // Allows to be always ready in case it is tied with the last promise in a chain of promises.
+    // ContinuationAwaiter waits during final_suspend of the promise for the resumption of continuations.
     template<typename T>
     class ContinuationAwaiter {
         public:
@@ -587,22 +569,19 @@ namespace acairo {
        public:
             using id_type = detail::Types::ID;
 
-            PromiseBase() {
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "PromiseBase is constructed.";
-            }
+            PromiseBase() = default;
 
-            ContinuationAwaiter<T> final_suspend() noexcept {              
+            ContinuationAwaiter<T> final_suspend() const noexcept {              
                 return ContinuationAwaiter<T>(); 
             }
 
-            void on_finish_callback(std::function<void()>&& on_finish) noexcept {
+            void on_finish_callback(std::function<void(std::exception_ptr e)>&& on_finish) noexcept {
                 m_on_finish = std::move(on_finish);
             }
 
             void on_finish()  {
                 if (m_on_finish) {
-                    m_on_finish();
+                    m_on_finish(m_eptr);
                 }
             }
 
@@ -616,7 +595,7 @@ namespace acairo {
             to coroutine_handle::resume() to be noexcept, so you should generally only use this
             approach when you have full control over who/what calls resume().
             */
-            void unhandled_exception() {
+            void unhandled_exception() noexcept {
                 m_eptr = std::current_exception();
 
                 try {
@@ -653,7 +632,7 @@ namespace acairo {
             template <typename FutureType>
             typename std::enable_if<std::is_base_of<Future, FutureType>::value, FutureAwaiter<FutureType>>::type
             await_transform(FutureType&& future) {
-                return FutureAwaiter<FutureType>(std::move(future));
+                return FutureAwaiter<FutureType>(std::forward<FutureType>(future));
             }
 
             template <typename Awaitable>
@@ -662,15 +641,12 @@ namespace acairo {
                 return std::forward<Awaitable>(awaitable);
             }
 
-            virtual ~PromiseBase() {
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "~PromiseBase: " << m_id;
-            };
+            virtual ~PromiseBase() = default;
 
         private:
             std::coroutine_handle<> m_continuation;
 
-            std::function<void()> m_on_finish;
+            std::function<void(std::exception_ptr)> m_on_finish;
             std::exception_ptr m_eptr;
 
             id_type m_id;
@@ -680,9 +656,7 @@ namespace acairo {
         public:
             FinalTaskPromise() = default;
 
-            std::suspend_never initial_suspend() { 
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<void>::get_id();
+            std::suspend_never initial_suspend() const noexcept { 
                 return {};
             }
 
@@ -690,7 +664,7 @@ namespace acairo {
                 return FinalTask(std::coroutine_handle<FinalTaskPromise>::from_promise(*this)); 
             }
 
-            void return_void() noexcept {}
+            void return_void() const noexcept {}
     };
 
     template<typename T>
@@ -698,9 +672,7 @@ namespace acairo {
         public:
             Promise() = default;
 
-            std::suspend_always initial_suspend() { 
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<T>::get_id();
+            std::suspend_always initial_suspend() const noexcept { 
                 return {};
             }
 
@@ -729,9 +701,7 @@ namespace acairo {
         public:
             Promise<void>() = default;
 
-            std::suspend_always initial_suspend() { 
-                auto l = logger::Logger();
-                LOG(l, logger::info) << "initial_suspend: " << PromiseBase<void>::get_id();
+            std::suspend_always initial_suspend() const noexcept { 
                 return {};
             }
 
@@ -739,21 +709,16 @@ namespace acairo {
                 return Task<void>(std::coroutine_handle<Promise<void>>::from_promise(*this)); 
             }
 
-            void return_void() noexcept {}
+            void return_void() const noexcept {}
 
-            // get_value is not used, but needs to exist due to the Promise duality problem 
-            // (see comment on PromiseBase)
-            void get_return_value() {
+            void get_return_value() const {
                  if (auto eptr = PromiseBase<void>::get_exception(); eptr) {
                     std::rethrow_exception(eptr);
                 }
             } 
     };
 
-    struct TCPStreamConfiguration {
-        std::chrono::seconds read_timeout;
-        std::chrono::seconds write_timeout;
-    };
+    struct TCPStreamConfiguration {};
 
     class TCPStream {
         public:
@@ -765,8 +730,10 @@ namespace acairo {
                     m_executor->register_fd(fd);
                 }
 
+            // TODO: An improvement could be to allow setting read timeouts
             acairo::Task<std::vector<char>> read(size_t number_of_bytes);
 
+            // TODO: An improvement could be to allow setting write timeouts
             acairo::Task<void> write(std::vector<char>&& buffer);
 
             ~TCPStream() noexcept;
@@ -781,7 +748,6 @@ namespace acairo {
 
     struct TCPListenerConfiguration {
         TCPStreamConfiguration stream_config;
-        size_t max_number_of_fds;
         int max_number_of_queued_conns;
     };
 

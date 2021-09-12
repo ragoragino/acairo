@@ -3,12 +3,12 @@
 #include <vector>
 #include <string>
 #include <csignal>
+#include <semaphore.h>
 
 #include "acairo.h"
 #include "logger.hpp"
 
-volatile sig_atomic_t sig_flag = 0;
-volatile sig_atomic_t force_shutdown = 0;
+sem_t shutdown_semaphore;
 
 acairo::Task<void> handle_socket(std::shared_ptr<acairo::TCPStream> stream) {
     auto l = logger::Logger();
@@ -47,45 +47,44 @@ int main(){
     logger::InitializeGlobalLogger(log_config);
     auto l = logger::Logger().WithPair("Component", "main");
 
-    // TODO: Allow draining
+    // Initialize acairo components
     SchedulerConfiguration scheduler_config{
-        number_of_worker_threads: 10,
+        number_of_worker_threads: 1,
     };
 
-    // Initialize acairo components
     ExecutorConfiguration executor_config{
        scheduler_config: scheduler_config,
        max_number_of_fds: 1024,
     };
 
-    TCPStreamConfiguration tcpstream_configuration{
-        read_timeout: 5s,
-        write_timeout: 5s,
-    };
+    TCPStreamConfiguration tcpstream_configuration{};
 
     TCPListenerConfiguration tcplistener_config{
         stream_config: tcpstream_configuration,
-        max_number_of_fds: 1024,
         max_number_of_queued_conns: 1024,
     };
 
     auto executor = std::make_shared<Executor>(executor_config);
     TCPListener listener(tcplistener_config, executor);
 
+    sem_init(&shutdown_semaphore, 0, 0);
+
     // https://www.informit.com/articles/article.aspx?p=2204014
     if (std::signal(SIGINT, [](int) -> void {
-        sig_flag = 1;
+        // sem_post() is async-signal-safe: it may be safely called within a
+        // signal handler: https://man7.org/linux/man-pages/man3/sem_post.3.html
+        sem_post(&shutdown_semaphore); 
     }) == SIG_ERR) {
         LOG(l, logger::error) << "Unable to register signal handler.";
         exit(1);
     }
 
-    // Create a handler that will watch shutdown signal and custom flags 
-    // and will stop acairo's listener and executor
+    // Create a handler that will watch for shutdown signals
+    // and will stop all the components when it will receive one
     auto shutdown_handler = std::thread([&](){
-        while (sig_flag == 0 && force_shutdown == 0) {
-            std::this_thread::sleep_for(500ms);
-        }
+        sem_wait(&shutdown_semaphore); 
+        
+        auto  l = logger::Logger();
 
         LOG(l, logger::debug) << "Shutting down cairo.";
 
@@ -106,16 +105,14 @@ int main(){
     try { 
         auto f = std::bind(handle_accept, executor, std::ref(listener));
         executor->sync_wait(std::move(f));
-        
-        // sync_wait stopped due to the handler stopping
-        force_shutdown = 1;
     } catch (const TCPListenerStoppedError& e) {
-        if (sig_flag == 0) {
-            LOG(l, logger::info) << "TCPListener stopped unexpectedly."; 
-            force_shutdown = 1;
-        }
+        // This is an exception that can occur during the stopping of Executor,
+        // so we can safely ignore it.
+        LOG(l, logger::warn) << "sync_wait stopped with: " << e.what(); 
     } catch (const std::exception& e) {
-        force_shutdown = 1;
+        LOG(l, logger::info) << "sync_wait failed with: " << e.what(); 
+
+        sem_post(&shutdown_semaphore); 
         shutdown_handler.join();
 
         throw;
