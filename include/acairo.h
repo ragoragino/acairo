@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <atomic>
 #include <condition_variable>
@@ -73,6 +74,19 @@ namespace acairo {
         }
     };
 
+    struct CancelledError : public std::exception {
+        public:
+            CancelledError(const std::string& msg) 
+            : m_what(msg) {}
+
+            const char * what () const noexcept {
+                return m_what.c_str();
+            }
+
+        private:
+            std::string m_what;
+    };
+
     static detail::Types::ID generate_id() {
         static thread_local std::mt19937 gen; 
         std::uniform_int_distribution<detail::Types::ID> distrib(0, std::numeric_limits<detail::Types::ID>::max());
@@ -83,8 +97,6 @@ namespace acairo {
         std::uint8_t number_of_worker_threads;
     };
 
-    // TODO: Maybe drain tasks at the end before returning?
-    // Some of the coroutines might potentially leak if we won't destroy them properly.
     class Scheduler {
         public:
             class WorkUnit {
@@ -116,6 +128,9 @@ namespace acairo {
             Scheduler(const SchedulerConfiguration& config) 
                 : m_threadPool(config.number_of_worker_threads)
                 , m_stopped(false)
+                , m_paused(false)
+                , m_notify_on_worker_waiting(false)
+                , m_waiting_workers_count(0)
                 , m_config(config)
                 , m_l(logger::Logger().WithPair("Component", "Scheduler")) {
                     for (std::uint8_t i = 0; i != m_config.number_of_worker_threads; i++) {
@@ -125,7 +140,11 @@ namespace acairo {
 
             void spawn(WorkUnit&& handler);
 
-            void stop();
+            void pause();
+
+            void restart();
+
+            void stop(bool drain);
 
         private:
             void run_worker() noexcept;
@@ -134,7 +153,11 @@ namespace acairo {
             
             std::vector<std::thread> m_threadPool;
 
-            std::atomic_bool m_stopped;
+            bool m_stopped;
+            bool m_paused;
+            std::condition_variable m_paused_cv;
+            bool m_notify_on_worker_waiting;
+            int m_waiting_workers_count;
 
             std::queue<WorkUnit> m_work_queue;
             std::mutex m_work_queue_mutex;
@@ -241,6 +264,8 @@ namespace acairo {
 
             void deregister_fd(int fd) const;
 
+            bool is_event_handler_cancelled(int fd, EVENT_TYPE event_type);
+
             void stop() {
                 m_stopping = true;
 
@@ -248,8 +273,25 @@ namespace acairo {
                     m_epoll_thread.join();
                 }
 
-                m_scheduler->stop();
+                // We pause the scheduler to stop all the tasks
+                // from executing, as executing them would mean
+                // that they might still be producing further tasks.
+                // We then schedule all the remaining tasks from the map of
+                // waiting coroutines. We know that all of them 
+                // will raise an exception as we are in the process
+                // of stopping. That way we can clean all the non-completed coroutines
+                // and avoid any memory leaks.
+                m_scheduler->pause();
 
+                for (auto& [key, c] : m_coroutines_map) {
+                    c.schedule();
+                }
+
+                m_scheduler->restart();
+
+                m_scheduler->stop(true);
+
+                // TODO: Is having two vars necessary?
                 m_stopped = true;
 
                 // Notify if there is someone synchronously waiting for the final coroutine (via sync_wait)
@@ -278,7 +320,7 @@ namespace acairo {
             int m_epoll_fd;
             std::thread m_epoll_thread; 
 
-            std::mutex m_coroutines_map_mutex;
+            std::shared_mutex m_coroutines_map_mutex;
             std::unordered_map<SocketEventKey, SocketEventCallback> m_coroutines_map;
             
             std::mutex m_sync_waiter_mutex;
@@ -374,7 +416,16 @@ namespace acairo {
                 }
             }
 
-            void await_resume() const noexcept {}
+            void await_resume() const {
+                auto executor = m_future_awaitable.get_executor();
+
+                int fd = m_future_awaitable.get_fd();
+                EVENT_TYPE event_type = m_future_awaitable.get_event_type();
+
+                if (executor->is_event_handler_cancelled(fd, event_type)) {
+                    throw CancelledError("Coroutine got cancelled by an Executor.");
+                }
+            }
 
         private:
             FutureType m_future_awaitable;
@@ -600,9 +651,15 @@ namespace acairo {
 
                 try {
                     std::rethrow_exception(m_eptr);
+                } catch (const CancelledError& e) {
+                    // CancelledError is an internal state signaling that a coroutine
+                    // is in the process of destruction. Therefore, we don't need to
+                    // log it as an error. 
+                    auto l = logger::Logger();
+                    LOG(l, logger::info) << "Promise [" << m_id << "] got cancelled: " << e.what();
                 } catch (const std::exception& e) {
                     auto l = logger::Logger();
-                    LOG(l, logger::error) << "Promise [" << m_id << "] failed with an error: " << e.what() << ".";
+                    LOG(l, logger::error) << "Promise [" << m_id << "] failed with an error: " << e.what();
                 }
             }
 

@@ -2,6 +2,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <csignal>
 #include <semaphore.h>
 
@@ -37,6 +38,11 @@ acairo::Task<void> handle_accept(std::shared_ptr<acairo::Executor> executor,
     }
 }
 
+// Replicating the behaviour of Golang's defer, where
+// funcs are run before exiting function scope.
+// Here we use it to invoke destructors for non-RAII objects.
+using defer = std::shared_ptr<void>;
+
 int main(){
     using namespace acairo;
 
@@ -67,7 +73,15 @@ int main(){
     auto executor = std::make_shared<Executor>(executor_config);
     TCPListener listener(tcplistener_config, executor);
 
+    // Initialize semaphore and also its destructor
     sem_init(&shutdown_semaphore, 0, 0);
+    defer _(nullptr, [l](...){
+        if (int error_code = sem_destroy(&shutdown_semaphore); error_code < 0) {
+            std::stringstream ss{};
+            ss << "Unable to destroy semaphore: " << strerror(errno) << ".";
+            LOG(l, logger::error) << ss.str(); 
+        };
+    });
 
     // https://www.informit.com/articles/article.aspx?p=2204014
     if (std::signal(SIGINT, [](int) -> void {

@@ -113,8 +113,39 @@ namespace acairo {
         m_work_queue_cv.notify_one();
     }
 
-    void Scheduler::stop() {
-        m_stopped = true;
+    void Scheduler::pause() {
+        std::unique_lock<std::mutex> lock(m_work_queue_mutex);
+        m_paused = true;
+        m_notify_on_worker_waiting = true;
+        m_paused_cv.wait(lock, [this](){
+            return m_waiting_workers_count == m_config.number_of_worker_threads;
+        });
+        m_notify_on_worker_waiting = false;
+    }
+
+    void Scheduler::restart(){
+        {
+            std::lock_guard<std::mutex> lock(m_work_queue_mutex);
+            m_paused = false;
+        }
+
+        m_work_queue_cv.notify_all();
+    }
+
+    void Scheduler::stop(bool drain) {
+        {
+            std::unique_lock<std::mutex> lock(m_work_queue_mutex);
+            if (drain && m_work_queue.size() != 0) {
+                m_notify_on_worker_waiting = true;
+                m_paused_cv.wait(lock, [this](){
+                    return m_work_queue.size() == 0;
+                });
+                m_notify_on_worker_waiting = false;
+            }
+
+            m_stopped = true;
+        }
+
         m_work_queue_cv.notify_all();
 
         for (auto& worker : m_threadPool) {
@@ -137,8 +168,10 @@ namespace acairo {
                     work_unit->operator()();
                     LOG(m_l, logger::debug) << "Successfully finished work unit: " << work_id;
                 }
+            } catch (const CancelledError& e) {
+                LOG(m_l, logger::debug) << "Work unit [" << work_id << "] got cancelled: " << e.what();
             } catch (const std::exception& e) {
-                LOG(m_l, logger::error) << "Work unit [" << work_id << "] failed with an error: " << e.what() << ".";
+                LOG(m_l, logger::error) << "Work unit [" << work_id << "] failed with an error: " << e.what();
             }
         }
     }
@@ -146,8 +179,22 @@ namespace acairo {
     std::optional<Scheduler::WorkUnit> Scheduler::get_new_work_unit() {
         std::unique_lock<std::mutex> lock(m_work_queue_mutex);
 
-        if (m_work_queue.size() == 0) {
-            m_work_queue_cv.wait(lock, [this]{ return m_work_queue.size() > 0 || m_stopped; });
+        if (m_stopped) {
+            return {};
+        }
+
+        if (m_work_queue.size() == 0 || m_paused) {
+            m_waiting_workers_count++;
+            if (m_notify_on_worker_waiting) {
+                m_paused_cv.notify_one();
+            }
+
+            m_work_queue_cv.wait(lock, [this] { 
+                bool can_continue = m_paused ? false : m_work_queue.size() != 0;
+                return can_continue || m_stopped; 
+            });
+            m_waiting_workers_count--;
+
             if (m_stopped) {
                 return {};
             }
@@ -203,7 +250,7 @@ namespace acairo {
 
         LOG(m_l, logger::debug) << "Registering callback for fd [" << fd << "] and event [" << event_type << "].";
 
-        std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+        std::unique_lock<std::shared_mutex> lock(m_coroutines_map_mutex);
         m_coroutines_map.try_emplace(socket_event_key, m_scheduler);
         m_coroutines_map[socket_event_key].set_callback(Scheduler::WorkUnit(std::forward<Callable>(callable)));
     }
@@ -225,7 +272,7 @@ namespace acairo {
                 throw std::runtime_error(error_with_errno("Waititing for epoll_events failed"));
             }
 
-            std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+            std::unique_lock<std::shared_mutex> lock(m_coroutines_map_mutex);
             for (int i = 0; i < count_of_ready_fds; i++) {
                 const struct epoll_event& event = events.get()[i];
                 const int fd = event.data.fd;
@@ -266,7 +313,7 @@ namespace acairo {
     }
 
     void Executor::deregister_event_handler(int fd, EVENT_TYPE event_type) {
-        std::lock_guard<std::mutex> lock(m_coroutines_map_mutex);
+        std::unique_lock<std::shared_mutex> lock(m_coroutines_map_mutex);
 
         auto socket_event_key = SocketEventKey{
             fd: fd,
@@ -277,6 +324,14 @@ namespace acairo {
             if (m_coroutines_map[socket_event_key].has_callback()) {
                 LOG(m_l, logger::warn) << socket_event_key.event_type << " event handlers for fd" << 
                     socket_event_key.fd << " active while deregistering fd from coroutines map.";
+            
+                // We schedule the coroutine here to fully destroy it.
+                // The coroutine, upon awaking, will ask the executor 
+                // if it is cancelled. The executor won't find the 
+                // coroutine in its map and therefore will consider it as 
+                // cancelled. The coroutine then can destroy itself
+                // by propagating CancelledError exception.
+                m_coroutines_map[socket_event_key].schedule();
             }
 
             m_coroutines_map.erase(socket_event_key);
@@ -292,6 +347,23 @@ namespace acairo {
         if (retry_sys_call(epoll_ctl, m_epoll_fd, EPOLL_CTL_DEL, fd, (struct epoll_event *)nullptr) < 0) {
             throw std::runtime_error(error_with_errno("Unable to deregister fd from the epoll interest list"));
         }
+    }
+
+    bool Executor::is_event_handler_cancelled(int fd, EVENT_TYPE event_type) {
+        // If Executor is in stopping mode, we consider all coroutines
+        // to be cancelled.
+        if (m_stopping.load()) {
+            return true;
+        }
+
+        // For cancellation of a particular coroutine, we just check 
+        // whether the event handler was deregistered from the map of coroutines.
+        std::shared_lock lock(m_coroutines_map_mutex);
+        auto socket_event_key = SocketEventKey{
+            fd: fd,
+            event_type: event_type,
+        };
+        return m_coroutines_map.find(socket_event_key) == m_coroutines_map.end();
     }
 
     int Executor::get_epoll_event_type(EVENT_TYPE event_type) {
@@ -329,15 +401,25 @@ namespace acairo {
         }
 
         if (m_stopped) {
-            // Try destryoing the underlying coroutine handle, as scheduler is stopped
-            // and it is guaranteed no work unit can be running. Therefore it should
-            // be safe to destroy the coroutine.
-            task.destroy();
             return;
         }
     
         if (coroutine_state->exception_ptr != nullptr) {
-            std::rethrow_exception(coroutine_state->exception_ptr);
+            // We check whether the exception thrown is CancelledError.
+            // This would suggest that the handler got cancelled either
+            // by getting deregistered from the Executor, or by getting
+            // scheduled when the Executor was stopping. 
+            // These types of errors are internal states and therefore
+            // we catch them here as they don't signal any error conditions
+            // to the user.
+            try {
+                std::rethrow_exception(coroutine_state->exception_ptr);
+            } catch (const CancelledError& e) {
+                auto l = logger::Logger();
+                LOG(l, logger::debug) << "FinalTask got cancelled in sync_wait: " << e.what();
+            } catch (const std::exception& e) {
+                throw;
+            }
         }
     }
 
