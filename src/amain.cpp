@@ -6,7 +6,7 @@
 #include <csignal>
 #include <semaphore.h>
 
-#include "acairo.h"
+#include "acairo.hpp"
 #include "logger.hpp"
 
 sem_t shutdown_semaphore;
@@ -121,7 +121,7 @@ int main(){
         executor->sync_wait(std::move(f));
     } catch (const TCPListenerStoppedError& e) {
         // This is an exception that can occur during the stopping of Executor,
-        // so we can safely ignore it.
+        // so we can safely ignore it
         LOG(l, logger::warn) << "sync_wait stopped with: " << e.what(); 
     } catch (const std::exception& e) {
         LOG(l, logger::info) << "sync_wait failed with: " << e.what(); 

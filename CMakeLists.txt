@@ -10,7 +10,14 @@ FIND_PACKAGE(ragolibcpp REQUIRED)
 
 INCLUDE_DIRECTORIES(${ragolibcpp_INCLUDE_DIRS})
 
-ADD_LIBRARY(acairo STATIC "src/acairo.cpp")
+ADD_LIBRARY(acairo STATIC 
+    "src/common.cpp" 
+    "src/executor.cpp"
+    "src/scheduler.cpp"
+    "src/task.cpp"
+    "src/tcplistener.cpp"
+    "src/tcpstream.cpp"
+)
 
 TARGET_LINK_LIBRARIES(acairo 
     PUBLIC Threads::Threads
@@ -31,7 +38,3 @@ TARGET_LINK_LIBRARIES(acairomain
     PRIVATE acairo
     PRIVATE ragolibcpp
 )
-
-# TODO: 
-# move to separate files
-# flag: -ggdb3 and command: valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes --verbose --log-file=valgrind.txt ./acairomain
